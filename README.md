@@ -43,11 +43,34 @@ VM в Казахстане как **локальный «модем»** — ин
 6. **Фенсинг `ethN`** от `systemd-networkd` / NetworkManager (`Unmanaged`), чтобы
    они не подняли DHCP и не переназначили адрес.
 
+## Транспорт: sing-box
+
+Движок socks5→tun — **sing-box** (по одному инстансу на netns).
+
+- **Супервизия — systemd-шаблон** `proxyveth-singbox@N.service` с
+  `NetworkNamespacePath=/run/netns/ns_N` → sing-box крутится **внутри netns**,
+  `Restart=always`. Заменяет `nohup`+`pkill watchdog` старого кода.
+- `auto_route: false` — маршрутами рулим МЫ (`ip rule`/`ip route`), sing-box их не трогает.
+- `stack: "system"` — легче, чем gVisor у tun2socks (важно при 100 инстансах).
+- **UDP → `action: reject` (method default)** — ICMP unreachable, поэтому QUIC
+  **быстро падает на TCP** (старый silent `iptables DROP` вешал ожиданием), и UDP
+  **не уходит в socks** → не флудим и не убиваем 3proxy. Лечит обе стороны старой болезни.
+- sing-box сам создаёт и адресует `tunN` (`10.0.N.1/30`); мы только добавляем
+  `default dev tunN` и `192.168.N.1/32 dev tunN` (управление модемом) ПОСЛЕ старта.
+- `mtu: 1500` — knob. При зависании КРУПНЫХ передач пробовать `1400`,
+  но это **не первый подозреваемый** (история: 20ч по MTU оказались тупиком,
+  тест-сайты 2ip/cloudflare сами висят на мобильных IP).
+
+### DNS — почему reject UDP его не ломает
+
+DNS для проксируемого трафика резолвит **сам mproxy на VM** (nodejs `lib/dns-cache.js`)
+ДО тоннеля: mproxy получает IP и только TCP-соединение к этому IP идёт в тоннель.
+Значит DNS **не ходит через tun** → reject UDP его не затрагивает. Per-netns
+`resolv.conf` нужен лишь для редких нужд внутри ns. (Проверить на VM, прочитав
+`lib/dns-cache.js`: точно ли резолв локальный, а не remote-DNS через socks.)
+
 ## Открытые вопросы (решаем дальше)
 
-- **Движок транспорта** (socks5 → tun) — главная развилка. Кандидаты:
-  `tun2socks` (gVisor, тяжёлый — 100 процессов на VM), `hev-socks5-tunnel`
-  (C, лёгкий, корректный MTU), `sing-box`. Сейчас — заглушка `start_transport()`.
 - **Проверить на VM:** connected-route `192.168.N.0/24 dev ethN` в main-таблице
   не должен перехватывать трафик к `.1` — полагаемся на policy-routing
   (mproxy шлёт mgmt с source `.100` → таблица `100+N` → в netns → тоннель).
@@ -66,5 +89,6 @@ VM в Казахстане как **локальный «модем»** — ин
 ## Статус
 
 `proxyveth.py` — скелет. `run()` по умолчанию **dry-run** (печатает план команд);
-выполнение — только с `--apply`. Тяжёлые части (`start_transport`, `sync`,
-`watchdog`, `status`) — заглушки.
+выполнение — только с `--apply`. Реализовано: bring_up/tear_down (план),
+`start_transport` (sing-box: конфиг + systemd). Заглушки: `sync` (Google Sheets),
+`status`, `watchdog`, `fence_iface` (networkd/NM), `write_netns_resolv`.
