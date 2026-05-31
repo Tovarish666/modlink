@@ -31,10 +31,11 @@ mkdir -p /etc/proxyveth/singbox
 echo "[4/6] modems.conf"
 if [ ! -f /etc/proxyveth/modems.conf ]; then
   cat > /etc/proxyveth/modems.conf <<'EOF'
-# По одной проксе на строку:  host:port:login:password
-# N модема = номер НЕПУСТОЙ строки (1-based) -> интерфейс ethN, адрес 192.168.N.100
-# Впиши свои прокси (пример формата, значения фейковые):
-# 203.0.113.10:1080:proxyuser:proxypass
+# Формат строки:  N host:port:login:password
+# N = ЯВНЫЙ номер модема = третий октет (192.168.N.100/.1); "номерок" из таблицы (col A).
+# Порядок строк и пропуски не важны. Пример (значения фейковые):
+# 4 203.0.113.10:1080:proxyuser:proxypass
+# 41 203.0.113.11:1080:proxyuser:proxypass
 EOF
   chmod 600 /etc/proxyveth/modems.conf
   echo "  создан /etc/proxyveth/modems.conf (впиши прокси!)"

@@ -120,7 +120,7 @@ VM в Казахстане как **локальный «модем»** — ин
 
 ```bash
 sudo bash deploy.sh                      # пакеты + sing-box + proxyveth + sysctl
-sudo nano /etc/proxyveth/modems.conf     # host:port:login:password по строке (N = номер строки)
+sudo nano /etc/proxyveth/modems.conf     # строка: N host:port:login:password (N = явный номер модема)
 proxyveth up 1                           # dry-run: посмотреть план
 sudo proxyveth up 1 --apply              # поднять модем 1 (eth1 @ 192.168.1.100)
 sudo proxyveth check 1                   # exit IP (.100) + Huawei .1 + sing-box

@@ -283,22 +283,34 @@ def tear_down(m: Modem) -> None:
 
 # ---------------------------------------------------------------------------
 def load_modems() -> dict[int, Modem]:
-    """Читает /etc/proxyveth/modems.conf. Строка: host:port:login:password.
-    N модема = номер непустой строки (1-based)."""
+    """Читает /etc/proxyveth/modems.conf. Формат строки:
+
+        N host:port:login:password
+
+    где N — ЯВНЫЙ номер модема = третий октет 192.168.N.x ("номерок" из таблицы,
+    col A). Порядок строк и пропуски значения НЕ имеют — связка прокся↔физмодем
+    зашита в самой проксе, а N задаёт адреса .100/.1 на стороне VM."""
     modems: dict[int, Modem] = {}
     if not os.path.exists(MODEMS_CONF):
         return modems
-    n = 0
-    for raw in open(MODEMS_CONF):
+    for ln, raw in enumerate(open(MODEMS_CONF), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        n += 1
         try:
-            host, port, login, password = line.split(":", 3)
-            modems[n] = Modem(n, host.strip(), int(port), login.strip(), password.strip())
+            num, spec = line.split(None, 1)            # "N  host:port:login:password"
+            n = int(num)
+            host, port, login, password = spec.split(":", 3)
+            port = int(port)
         except ValueError:
-            sys.stderr.write(f"  ! строка {n}: неверный формат (нужно host:port:login:password)\n")
+            sys.stderr.write(f"  ! строка {ln}: формат 'N host:port:login:password'\n")
+            continue
+        if not (1 <= n <= 254):
+            sys.stderr.write(f"  ! строка {ln}: N={n} вне диапазона 1..254 (третий октет)\n")
+            continue
+        if n in modems:
+            sys.stderr.write(f"  ! строка {ln}: N={n} дублируется — перезаписываю\n")
+        modems[n] = Modem(n, host.strip(), port, login.strip(), password.strip())
     return modems
 
 
