@@ -106,7 +106,30 @@ VM в Казахстане как **локальный «модем»** — ин
 
 ## Статус
 
-`proxyveth.py` — скелет. `run()` по умолчанию **dry-run** (печатает план команд);
-выполнение — только с `--apply`. Реализовано: bring_up/tear_down (план),
-`start_transport` (sing-box: конфиг + systemd). Заглушки: `sync` (Google Sheets),
-`status`, `watchdog`, `fence_iface` (networkd/NM), `write_netns_resolv`.
+`run()`/`up`/`down` по умолчанию **dry-run** (печатают план); реально — флаг `--apply`.
+`check`/`status` — read-only, выполняются всегда.
+
+Реализовано: `bring_up`/`tear_down`, `start_transport` (sing-box: конфиг + systemd),
+`fence_iface` (NM + networkd Unmanaged), `write_netns_resolv`, загрузка модемов из
+`/etc/proxyveth/modems.conf`, `check` (exit IP + Huawei .1 + sing-box), `status`.
+Заглушки: `sync` (Google Sheets), `watchdog`.
+
+## Деплой и тест (experimental)
+
+На ЧИСТОЙ Ubuntu (десктоп с GUI = NetworkManager — `fence_iface` это учитывает):
+
+```bash
+sudo bash deploy.sh                      # пакеты + sing-box + proxyveth + sysctl
+sudo nano /etc/proxyveth/modems.conf     # host:port:login:password по строке (N = номер строки)
+proxyveth up 1                           # dry-run: посмотреть план
+sudo proxyveth up 1 --apply              # поднять модем 1 (eth1 @ 192.168.1.100)
+sudo proxyveth check 1                   # exit IP (.100) + Huawei .1 + sing-box
+sudo proxyveth down 1 --apply            # снять
+```
+
+**Что проверяем:**
+- `exit IP (.100)` = мобильный IP СПб → **данные через тоннель работают**.
+- `Huawei .1` через `.100` → тоннель до веб-морды модема (curl биндит `.100`, поэтому
+  должно идти в тоннель; это НЕ тест mproxy-mgmt — тот не биндит `.100`, см. риск выше).
+- если exit IP пуст/таймаут на ipify — пробуй `curl --interface 192.168.1.100 -I https://www.google.com`
+  (мёртвые тест-сайты на мобильных IP — известный ложный сигнал).
