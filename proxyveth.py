@@ -256,7 +256,12 @@ def bring_up(m: Modem) -> None:
 
     # 7. маршруты через тоннель (tunN уже существует)
     run(f"ip route add default dev {tun}", ns=ns)
-    run(f"ip route add {net}.{MGMT_OCTET}/32 dev {tun}", ns=ns)   # управление модемом -> тоннель
+    run(f"ip route add {net}.{MGMT_OCTET}/32 dev {tun}", ns=ns)   # .1 ВНУТРИ ns -> тоннель
+    # ОТКРЫТЫЙ РИСК (см. README): mproxy НЕ биндит mgmt-запросы к .1 на .100
+    # (modem-handlers.js:329 -> Huawei_auth без localAddress) => host->.1 сам в
+    # тоннель НЕ попадёт (connected /24 на ethN -> ARP .1 -> пусто). Кандидат-фикс,
+    # ПРОВЕРИТЬ на VM (не вслепую): host-route .1/32 via .254 + ip_forward/NAT в ns:
+    #   run(f"ip route add {net}.{MGMT_OCTET}/32 via {net}.{NS_OCTET} dev {host_if}")
     print(f"   modem {m.n} READY (dry-run plan)" if DRY_RUN else f"   modem {m.n} up")
 
 
