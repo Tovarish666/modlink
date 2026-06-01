@@ -470,6 +470,11 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
 <script>
 let localIp='', extIp='', basePort=10000, confDirty=false, hasTls=false;
 
+window.onerror=function(msg,src,line){
+  toast('JS: '+msg+' (line '+line+')','err',15000);return false;};
+window.addEventListener('unhandledrejection',function(e){
+  toast('Promise: '+e.reason,'err',10000);});
+
 function toast(msg,type='info',ms=3200){
   const el=document.createElement('div');el.className=`toast ${type}`;el.textContent=msg;
   document.getElementById('toasts').appendChild(el);setTimeout(()=>el.remove(),ms);
