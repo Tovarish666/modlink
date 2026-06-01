@@ -27,6 +27,11 @@ else:
 MODEMS_CONF  = CONF_DIR / "modems.conf"
 SB_CONF      = CONF_DIR / "singbox.json"
 SERVER_CONF  = CONF_DIR / "server.json"
+CERT_FILE    = CONF_DIR / "certs" / "cert.pem"
+KEY_FILE     = CONF_DIR / "certs" / "key.pem"
+
+def has_tls() -> bool:
+    return CERT_FILE.exists() and KEY_FILE.exists()
 
 DEFAULT_BASE_PORT = 10000
 
@@ -119,13 +124,18 @@ def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -
         port    = base_port + m["n"]
         tag_in  = f"in-{m['n']}"
         tag_out = f"out-{m['n']}"
-        inbounds.append({
+        inbound: dict = {
             "type": "mixed",
             "tag": tag_in,
             "listen": "0.0.0.0",
             "listen_port": port,
             "users": [{"username": f"modem{m['n']}", "password": m["password"]}],
-        })
+        }
+        if has_tls():
+            inbound["tls"] = {"enabled": True,
+                              "certificate_path": str(CERT_FILE),
+                              "key_path": str(KEY_FILE)}
+        inbounds.append(inbound)
         outbounds.append({
             "type": "direct",
             "tag": tag_out,
@@ -203,7 +213,14 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == "/":
-            self._send(200, HTML_PAGE.encode(), "text/html; charset=utf-8")
+            body = HTML_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         elif path == "/api/info":
             sconf = load_server_conf()
@@ -433,7 +450,7 @@ function makeRow(n='',pass=''){
   const p=pass||randPass();
   const port=n?calcPort(n):'—';
   tr.innerHTML=`
-    <td class="col-n"><input class="inp-n" type="number" min="1" max="254" value="${n}" placeholder="N" oninput="onN(this)"></td>
+    <td class="col-n"><input class="inp-n" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" value="${n}" placeholder="N" oninput="onN(this)"></td>
     <td class="col-login"><input type="text" value="${n?'modem'+n:''}" readonly tabindex="-1"></td>
     <td class="col-port"><input type="text" value="${port}" readonly tabindex="-1" id="port-${n}"></td>
     <td class="col-pass"><div class="pass-wrap"><input type="text" value="${p}" autocomplete="off"><button class="btn btn-icon" onclick="repass(this)" title="Новый пароль">↺</button></div></td>
@@ -446,6 +463,7 @@ function makeRow(n='',pass=''){
 }
 
 function onN(inp){
+  inp.value=inp.value.replace(/\D/g,'').slice(0,3);   // только цифры, max 3
   const tr=inp.closest('tr');const n=inp.value;tr.dataset.n=n;
   tr.querySelector('.col-login input').value=n?`modem${n}`:'';
   const portInp=tr.querySelector('.col-port input');
