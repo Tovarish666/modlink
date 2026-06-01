@@ -503,7 +503,7 @@ function makeRow(n='',pass=''){
 }
 
 function onN(inp){
-  inp.value=inp.value.replace(/\D/g,'').slice(0,3);   // только цифры, max 3
+  inp.value=inp.value.replace(/\\D/g,'').slice(0,3);   // только цифры, max 3
   const tr=inp.closest('tr');const n=inp.value;tr.dataset.n=n;
   tr.querySelector('.col-login input').value=n?`modem${n}`:'';
   const portInp=tr.querySelector('.col-port input');
