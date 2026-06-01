@@ -104,32 +104,38 @@ if (-not (Test-Path $certFile)) {
         & $openssl req -x509 -newkey rsa:2048 -nodes `
             -keyout $keyFile -out $certFile `
             -days 3650 -subj "/CN=modlink" 2>&1 | Out-Null
-        Ok "Сертификат создан (openssl)"
+        Ok "TLS: openssl"
     } else {
-        # fallback — PowerShell PKI + экспорт PEM
-        Warn "openssl не найден, использую PowerShell PKI…"
-        $cert = New-SelfSignedCertificate `
-            -DnsName "modlink" `
-            -CertStoreLocation "Cert:\CurrentUser\My" `
-            -NotAfter (Get-Date).AddYears(10) `
-            -KeyAlgorithm RSA -KeyLength 2048
+        # PowerShell PKI + ExportPkcs8PrivateKey (.NET 4.7.2+, Win10 1709+)
+        Info "openssl не найден — использую PowerShell PKI (.NET)…"
+        try {
+            $cert = New-SelfSignedCertificate `
+                -DnsName "modlink" `
+                -CertStoreLocation "Cert:\CurrentUser\My" `
+                -NotAfter (Get-Date).AddYears(10) `
+                -KeyAlgorithm RSA -KeyLength 2048 `
+                -KeyExportPolicy Exportable
 
-        # cert → PEM
-        $certB64 = [Convert]::ToBase64String($cert.RawData, "InsertLineBreaks")
-        "-----BEGIN CERTIFICATE-----`r`n$certB64`r`n-----END CERTIFICATE-----" | Set-Content $certFile
+            # cert → PEM
+            $certB64 = [Convert]::ToBase64String($cert.RawData, "InsertLineBreaks")
+            "-----BEGIN CERTIFICATE-----`n$certB64`n-----END CERTIFICATE-----" |
+                Set-Content $certFile -Encoding ASCII
 
-        # key → PFX → нет прямого способа без openssl; сохраняем PFX и предупреждаем
-        $pfxPath = "$CONF_DIR\certs\key.pfx"
-        $pfxPass = ConvertTo-SecureString "modlink" -AsPlainText -Force
-        Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $pfxPass | Out-Null
-        Warn "Ключ сохранён как PFX ($pfxPath, пароль: modlink)."
-        Warn "Для полной работы установи Git for Windows (openssl) и перезапусти deploy-win.ps1."
-        Warn "Временно panel будет работать без TLS на порту $PANEL_PORT."
-        # Отключаем TLS в этой сессии — panel всё равно работает локально
-        $env:MODLINK_NO_TLS = "1"
+            # private key → PKCS8 PEM (ExportPkcs8PrivateKey доступен с .NET 4.7.2)
+            $rsa      = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+            $keyBytes = $rsa.ExportPkcs8PrivateKey()
+            $keyB64   = [Convert]::ToBase64String($keyBytes, "InsertLineBreaks")
+            "-----BEGIN PRIVATE KEY-----`n$keyB64`n-----END PRIVATE KEY-----" |
+                Set-Content $keyFile -Encoding ASCII
+
+            Ok "TLS: PowerShell PKI (.NET) — cert.pem + key.pem готовы"
+        } catch {
+            Warn "Не удалось создать TLS сертификат: $_"
+            Warn "Установи Git for Windows (openssl внутри) и перезапусти скрипт."
+        }
     }
 } else {
-    Ok "Сертификат уже есть"
+    Ok "TLS сертификат уже есть"
 }
 
 # ── 6. Скачать panel.py и server.py ───────────────────────────────────────

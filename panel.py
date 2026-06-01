@@ -124,7 +124,7 @@ def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -
             "tag": tag_in,
             "listen": "0.0.0.0",
             "listen_port": port,
-            "users": [{"username": f"modem-{m['n']}", "password": m["password"]}],
+            "users": [{"username": f"modem{m['n']}", "password": m["password"]}],
         })
         outbounds.append({
             "type": "direct",
@@ -212,6 +212,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ext_ip":    sconf.get("ext_ip", ""),
                 "base_port": sconf.get("base_port", DEFAULT_BASE_PORT),
                 "status":    get_sb_status(),
+                "tls":       has_tls(),
             })
 
         elif path == "/api/modems":
@@ -238,8 +239,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": f"модем {n} не найден"}, 404)
             sconf    = load_server_conf()
             port     = sconf.get("base_port", DEFAULT_BASE_PORT) + n
-            proxy    = f"http://modem-{n}:{m['password']}@127.0.0.1:{port}"
-            curl_cmd = f'curl -s --max-time 8 --proxy "{proxy}"'
+            scheme   = "https" if has_tls() else "http"
+            proxy    = f"{scheme}://modem{n}:{m['password']}@127.0.0.1:{port}"
+            insecure = "--proxy-insecure" if has_tls() else ""
+            curl_cmd = f'curl -s --max-time 8 --proxy "{proxy}" {insecure}'.strip()
             r1 = subprocess.run(f"{curl_cmd} http://ip.me",
                                 shell=True, capture_output=True, text=True, timeout=12)
             exit_ip = r1.stdout.strip()
@@ -328,13 +331,15 @@ tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
 tbody tr:last-child{border-bottom:none}
 tbody tr:hover{background:rgba(255,255,255,.025)}
 td{padding:6px 10px;vertical-align:middle}
-.col-n{width:60px}.col-login{width:120px}.col-port{width:76px}.col-pass{min-width:160px}.col-test{width:140px}.col-act{width:84px;text-align:right}
+.col-n{width:64px}.col-login{width:120px}.col-port{width:76px}.col-pass{min-width:160px}.col-test{width:160px}.col-act{width:84px;text-align:right}
 
 input[type=text],input[type=number]{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:13px;font-family:monospace;padding:5px 8px;width:100%;outline:none;transition:border-color .15s}
 input:focus{border-color:var(--accent)}
 input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
-.inp-n{width:50px}
+.inp-n{width:56px;-moz-appearance:textfield}
+.inp-n::-webkit-inner-spin-button,.inp-n::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 .pass-wrap{display:flex;gap:4px}.pass-wrap input{flex:1}
+.badge-h{font-size:10px;padding:1px 4px;border:1px solid var(--success);border-radius:3px;color:var(--success);margin-left:4px;vertical-align:middle;white-space:nowrap}
 
 .btn{display:inline-flex;align-items:center;gap:5px;padding:6px 12px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px;cursor:pointer;transition:all .15s;white-space:nowrap;line-height:1.4}
 .btn:hover{border-color:var(--accent);color:var(--accent)}.btn:active{opacity:.75}
@@ -406,7 +411,7 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
 <div class="toasts" id="toasts"></div>
 
 <script>
-let localIp='', extIp='', basePort=10000, confDirty=false;
+let localIp='', extIp='', basePort=10000, confDirty=false, hasTls=false;
 
 function toast(msg,type='info',ms=3200){
   const el=document.createElement('div');el.className=`toast ${type}`;el.textContent=msg;
@@ -429,7 +434,7 @@ function makeRow(n='',pass=''){
   const port=n?calcPort(n):'—';
   tr.innerHTML=`
     <td class="col-n"><input class="inp-n" type="number" min="1" max="254" value="${n}" placeholder="N" oninput="onN(this)"></td>
-    <td class="col-login"><input type="text" value="${n?'modem-'+n:''}" readonly tabindex="-1"></td>
+    <td class="col-login"><input type="text" value="${n?'modem'+n:''}" readonly tabindex="-1"></td>
     <td class="col-port"><input type="text" value="${port}" readonly tabindex="-1" id="port-${n}"></td>
     <td class="col-pass"><div class="pass-wrap"><input type="text" value="${p}" autocomplete="off"><button class="btn btn-icon" onclick="repass(this)" title="Новый пароль">↺</button></div></td>
     <td class="col-test"><span class="tres" id="tr${n}"></span></td>
@@ -442,7 +447,7 @@ function makeRow(n='',pass=''){
 
 function onN(inp){
   const tr=inp.closest('tr');const n=inp.value;tr.dataset.n=n;
-  tr.querySelector('.col-login input').value=n?`modem-${n}`:'';
+  tr.querySelector('.col-login input').value=n?`modem${n}`:'';
   const portInp=tr.querySelector('.col-port input');
   portInp.id=`port-${n}`;
   portInp.value=n?calcPort(n):'—';
@@ -478,7 +483,7 @@ function getRows(){
 async function loadInfo(){
   try{
     const d=await fetch('/api/info').then(r=>r.json());
-    localIp=d.local_ip; basePort=d.base_port;
+    localIp=d.local_ip; basePort=d.base_port; hasTls=d.tls||false;
     document.getElementById('localIp').textContent=d.local_ip;
     const dot=document.getElementById('dot');
     dot.className='dot '+(d.status==='active'?'on':'off');
@@ -558,7 +563,7 @@ async function doTest(btn){
     const d=await fetch(`/api/test/${n}`).then(r=>r.json());
     if(d.exit_ip){
       sp.className='tres ok';
-      sp.textContent=d.exit_ip+(d.huawei_ok?' ✓H':'');
+      sp.innerHTML=d.exit_ip+(d.huawei_ok?'<span class="badge-h">H✓</span>':'');
       sp.title=`exit: ${d.exit_ip}  Huawei: ${d.huawei_ok?'OK':'нет'}`;
     }else{sp.className='tres fail';sp.textContent=d.error||'нет ответа';}
   }catch(e){sp.className='tres fail';sp.textContent='ошибка';}
@@ -571,7 +576,7 @@ function copyClient(){
   const ip=document.getElementById('extIp').value.trim()||localIp;
   const bp=parseInt(document.getElementById('basePort').value)||basePort;
   // формат: IP:PORT:login:pass  (без N-префикса)
-  const lines=rows.map(m=>`${ip}:${bp+m.n}:modem-${m.n}:${m.password}`);
+  const lines=rows.map(m=>`${ip}:${bp+m.n}:modem${m.n}:${m.password}`);
   const text=lines.join('\\n');
   navigator.clipboard.writeText(text)
     .then(()=>toast(`Скопировано ${lines.length} строк`,'ok'))

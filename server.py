@@ -50,7 +50,7 @@ class Modem:
     @property
     def bind_ip(self) -> str:       return f"{self.net}.{HOST_OCTET}"
     @property
-    def username(self) -> str:      return f"modem-{self.n}"
+    def username(self) -> str:      return f"modem{self.n}"
     @property
     def huawei_ip(self) -> str:     return f"{self.net}.1"
     @property

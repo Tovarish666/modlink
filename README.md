@@ -1,24 +1,29 @@
-# modlink
+# modlink — server
 
-Turn remote modems into local network interfaces via HTTPS proxy.
+Exposes LTE modems as a managed HTTPS/SOCKS5 proxy pool.
 
-Each modem on a remote server (MSK/SPB) becomes a virtual eth interface on the target machine — with the same `192.168.N.1` gateway address and Huawei web-API accessible transparently through HTTP CONNECT.
-
-Transport: **sing-box HTTPS proxy** (TLS, Basic Auth per modem). No VPN protocols.
-
----
-
-## Components
-
-| File | Role |
-|---|---|
-| `server.py` | Runs on the **remote host** (where modems are). Starts sing-box as HTTPS proxy. |
-| `panel.py`  | Web UI for managing modems. Works on Linux (systemd) and Windows 10+. |
-| `deploy-win.ps1` | One-shot setup for Windows 10: Python, Flask, sing-box, TLS cert. |
+Each modem N → dedicated port `BASE_PORT + N` → sing-box `mixed` inbound (handles both HTTP CONNECT and SOCKS5) → outbound bound to `192.168.N.100` (modem interface).  
+Huawei web-API (`192.168.N.1`) accessible transparently via HTTP CONNECT through the proxy.
 
 ---
 
-## Remote server setup (Linux)
+## Architecture
+
+```
+Client (Proxmox / proxyveth)
+    │ HTTPS proxy  →  IP:PORT:modemN:pass
+    ▼
+modlink server  (this repo)
+    sing-box  mixed inbound  (port BASE+N, TLS)
+    │
+    outbound  bind 192.168.N.100
+    │
+    LTE modem N  →  internet (mobile IP)
+```
+
+---
+
+## Quick start — Linux
 
 ```bash
 # 1. Install sing-box
@@ -27,74 +32,104 @@ bash <(curl -fsSL https://sing-box.app/installer.sh)
 # 2. Get scripts
 curl -fsSL https://raw.githubusercontent.com/Tovarish666/modlink/main/server.py \
   -o /usr/local/bin/modlink-server && chmod +x /usr/local/bin/modlink-server
-
 curl -fsSL https://raw.githubusercontent.com/Tovarish666/modlink/main/panel.py \
-  -o /usr/local/bin/modlink-panel && chmod +x /usr/local/bin/modlink-panel
+  -o /usr/local/bin/modlink-panel  && chmod +x /usr/local/bin/modlink-panel
 
-# 3. Create modem list
+# 3. Create modem list  (/etc/modlink/modems.conf)
 mkdir -p /etc/modlink
-cat > /etc/modlink/modems.conf << 'EOF'
-# N  password
-4   abc123def4
-41  xyz987mnpq
-EOF
+printf "1  pass1\n2  pass2\n" > /etc/modlink/modems.conf
 
-# 4. Apply + verify
+# 4. Apply
 modlink-server apply
 modlink-server status
-modlink-server test 4
-```
+modlink-server test 1
 
-**Or use the web panel:**
-
-```bash
-pip install flask
-modlink-panel          # → http://localhost:5000
+# 5. Web panel
+python3 /usr/local/bin/modlink-panel    # → http://localhost:5000
 ```
 
 ---
 
-## Windows 10 setup (temporary)
+## Quick start — Windows 10 (temporary)
 
 ```powershell
-# Run PowerShell as Administrator:
+# Run as Administrator:
 Set-ExecutionPolicy Bypass -Scope Process
 irm https://raw.githubusercontent.com/Tovarish666/modlink/main/deploy-win.ps1 | iex
 ```
 
-Opens panel at `http://localhost:5000` automatically.
+What the script does:
+1. Checks / installs Python 3
+2. Downloads `sing-box.exe` (latest release)
+3. Generates self-signed TLS cert (PowerShell PKI, no openssl required)
+4. Downloads `panel.py` and `server.py`
+5. Registers autostart via Task Scheduler (runs as SYSTEM at boot)
+6. Opens panel at `http://localhost:5000`
+
+Manage the service:
+```powershell
+Start-ScheduledTask -TaskName "modlink-panel"
+Stop-ScheduledTask  -TaskName "modlink-panel"
+Get-ScheduledTask   -TaskName "modlink-panel" | Select TaskName, State
+```
 
 ---
 
 ## modems.conf format
 
 ```
-# /etc/modlink/modems.conf  (Linux)
+# /etc/modlink/modems.conf      (Linux)
 # %ProgramData%\modlink\modems.conf  (Windows)
 #
 # N  password
 # N = modem number = third octet of 192.168.N.x
-4   abc123def4
-41  xyz987mnpq
+1   abc123def4
+2   xyz987mnpq
 ```
 
 Passwords are auto-generated if omitted.
 
 ---
 
-## How gateway emulation works
+## Web panel features
 
-The remote server runs sing-box with L2 access to `192.168.N.1` (Huawei router).  
-A client doing `CONNECT 192.168.N.1:80` through the proxy gets transparently forwarded to the real device — no VPN, plain HTTP CONNECT.
+- **External IP** — auto-detect or set manually (shown in copy output)  
+- **Base port** — configurable (default 10000), modem N → port `BASE + N`  
+- **⟳ Auto** — fetches public IP from api.ipify.org  
+- **↺** — regenerate password per modem  
+- **▶ Test** — checks exit IP + Huawei `.1` API via proxy  
+- **⎘ Copy** — copies `IP:PORT:modemN:pass` lines (ready for client `modems.conf`)  
+- **Apply** — saves config + restarts sing-box  
 
 ---
 
-## Client modems.conf format
-
-After running `⎘ Copy` in the panel:
+## Proxy credentials format
 
 ```
-N  SERVER_IP:8443:modem-N:password
+IP:PORT:LOGIN:PASS
+
+Example (modem 1, base port 10000):
+  1.2.3.4:10001:modem1:abc123def4
+
+Protocol: HTTP CONNECT + SOCKS5 (mixed, on the same port)
+TLS: yes (self-signed cert, use --proxy-insecure or add cert to trust store)
 ```
 
-Paste into the client-side `modems.conf`.
+---
+
+## Port layout
+
+| Modem | Port      | Protocol       |
+|-------|-----------|----------------|
+| 1     | BASE+1    | HTTP + SOCKS5  |
+| 2     | BASE+2    | HTTP + SOCKS5  |
+| N     | BASE+N    | HTTP + SOCKS5  |
+
+Default BASE = 10000. One port per modem, both protocols.
+
+---
+
+## Huawei gateway emulation
+
+The remote server has L2 access to `192.168.N.1` (Huawei router web-API).  
+A client doing `CONNECT 192.168.N.1:80` through the proxy gets forwarded to the real device — same address, same API, no VPN.
