@@ -6,10 +6,13 @@ modlink panel — веб-панель управления. Только stdlib,
 """
 from __future__ import annotations
 import argparse, atexit, json, os, random, shutil, socket, subprocess
-import sys, time, webbrowser
+import re, sys, time, webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
+
+def strip_ansi(s: str) -> str:
+    return re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', s)
 
 # ---------------------------------------------------------------------------
 IS_WIN = sys.platform == "win32"
@@ -72,20 +75,28 @@ def save_modems(modems: list[dict]) -> None:
     lines = [f"{m['n']}  {m['password']}" for m in sorted(modems, key=lambda x: x["n"])]
     MODEMS_CONF.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+def has_tls() -> bool:
+    return CERT_FILE.exists() and KEY_FILE.exists()
+
+def proxy_scheme() -> str:
+    return "https" if has_tls() else "http"
+
 def gen_singbox_config(modems: list[dict]) -> dict:
     users     = [{"username": f"modem-{m['n']}", "password": m["password"]} for m in modems]
     outbounds = [{"type": "direct", "tag": f"out-{m['n']}",
                   "inet4_bind_address": f"192.168.{m['n']}.100"} for m in modems]
     rules     = [{"auth_user": [f"modem-{m['n']}"], "outbound": f"out-{m['n']}"} for m in modems]
+    inbound: dict = {
+        "type": "http", "listen": "0.0.0.0", "listen_port": PROXY_PORT,
+        "users": users,
+    }
+    if has_tls():
+        inbound["tls"] = {"enabled": True,
+                          "certificate_path": str(CERT_FILE),
+                          "key_path": str(KEY_FILE)}
     return {
         "log": {"level": "warn", "timestamp": True},
-        "inbounds": [{
-            "type": "http", "listen": "0.0.0.0", "listen_port": PROXY_PORT,
-            "users": users,
-            "tls": {"enabled": True,
-                    "certificate_path": str(CERT_FILE),
-                    "key_path": str(KEY_FILE)},
-        }],
+        "inbounds": [inbound],
         "outbounds": outbounds,
         "route": {"rules": rules},
     }
@@ -157,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/info":
             self._json({"ip": get_server_ip(), "port": PROXY_PORT,
-                        "status": get_sb_status()})
+                        "status": get_sb_status(), "tls": has_tls()})
 
         elif path == "/api/modems":
             self._json(load_modems())
@@ -171,7 +182,7 @@ class Handler(BaseHTTPRequestHandler):
             m = next((x for x in modems if x["n"] == n), None)
             if not m:
                 return self._json({"error": f"модем {n} не найден"}, 404)
-            proxy    = f"https://modem-{n}:{m['password']}@127.0.0.1:{PROXY_PORT}"
+            proxy    = f"{proxy_scheme()}://modem-{n}:{m['password']}@127.0.0.1:{PROXY_PORT}"
             curl_cmd = f'curl -s --max-time 8 --proxy "{proxy}" --proxy-insecure'
             r1 = subprocess.run(f"{curl_cmd} http://ip.me",
                                 shell=True, capture_output=True, text=True, timeout=12)
@@ -200,7 +211,7 @@ class Handler(BaseHTTPRequestHandler):
             save_modems(parsed)
             ok, status = apply_singbox(parsed)
             if not ok:
-                return self._json({"ok": False, "error": status}, 500)
+                return self._json({"ok": False, "error": strip_ansi(status)}, 500)
             self._json({"ok": True, "status": status})
         else:
             self._json({"error": "not found"}, 404)
@@ -269,6 +280,7 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
     <div class="chips">
       <div class="chip"><span class="chip-label">IP</span><span id="srvIp">…</span></div>
       <div class="chip"><span class="chip-label">Порт</span><span id="srvPort">…</span></div>
+      <div class="chip" id="tlsChip" title=""><div class="dot" id="tlsDot"></div><span id="tlsLabel">…</span></div>
       <div class="chip"><div class="dot" id="dot"></div><span id="srvStatus">…</span></div>
     </div>
   </div>
@@ -313,7 +325,7 @@ function repass(btn){btn.closest('.pass-wrap').querySelector('input').value=rand
 function addRow(n='',pass=''){const tb=document.getElementById('tbody');const em=tb.querySelector('.empty');if(em)em.closest('tr').remove();tb.appendChild(makeRow(n,pass));}
 function delRow(btn){btn.closest('tr').remove();const tb=document.getElementById('tbody');if(!tb.querySelector('tr'))tb.innerHTML='<tr><td colspan="5" class="empty">Нет модемов</td></tr>';}
 function getRows(){return[...document.querySelectorAll('#tbody tr[data-n]')].map(tr=>({n:parseInt(tr.dataset.n),password:tr.querySelector('.pass-wrap input').value.trim()})).filter(m=>m.n&&m.password);}
-async function loadInfo(){try{const d=await fetch('/api/info').then(r=>r.json());srvIp=d.ip;srvPort=d.port;document.getElementById('srvIp').textContent=d.ip;document.getElementById('srvPort').textContent=d.port;const dot=document.getElementById('dot');dot.className='dot '+(d.status==='active'?'on':'off');document.getElementById('srvStatus').textContent=d.status;}catch(e){}}
+async function loadInfo(){try{const d=await fetch('/api/info').then(r=>r.json());srvIp=d.ip;srvPort=d.port;document.getElementById('srvIp').textContent=d.ip;document.getElementById('srvPort').textContent=d.port;const dot=document.getElementById('dot');dot.className='dot '+(d.status==='active'?'on':'off');document.getElementById('srvStatus').textContent=d.status;const tlsDot=document.getElementById('tlsDot');const tlsLabel=document.getElementById('tlsLabel');const tlsChip=document.getElementById('tlsChip');if(d.tls){tlsDot.className='dot on';tlsLabel.textContent='TLS';tlsChip.title='Шифрование включено';}else{tlsDot.className='dot off';tlsLabel.textContent='no TLS';tlsChip.title='Сертификат не найден — прокся работает по HTTP (только для локальной сети)';};}catch(e){}}
 async function loadModems(){try{const ms=await fetch('/api/modems').then(r=>r.json());const tb=document.getElementById('tbody');tb.innerHTML='';if(!ms.length){tb.innerHTML='<tr><td colspan="5" class="empty">Нет модемов — нажми + Добавить</td></tr>';return;}ms.forEach(m=>tb.appendChild(makeRow(m.n,m.password)));}catch(e){}}
 async function doApply(){const rows=getRows();if(!rows.length){toast('Добавь хотя бы один модем','err');return;}const btn=document.getElementById('applyBtn');btn.disabled=true;btn.innerHTML='<span class="spin"></span>&nbsp;Применяю…';try{const d=await fetch('/api/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({modems:rows})}).then(r=>r.json());if(d.ok)toast(`Применено  sing-box: ${d.status}`,'ok');else toast(d.error||'Ошибка','err',6000);loadInfo();}catch(e){toast('Нет связи','err');}btn.disabled=false;btn.innerHTML='Применить';}
 async function doTest(btn){const tr=btn.closest('tr');const n=parseInt(tr.dataset.n);if(!n){toast('Укажи N','err');return;}btn.disabled=true;const sp=document.getElementById(`tr${n}`);sp.className='tres pend';sp.innerHTML='<span class="spin"></span>';try{const d=await fetch(`/api/test/${n}`).then(r=>r.json());if(d.exit_ip){sp.className='tres ok';sp.textContent=d.exit_ip+(d.huawei_ok?' ✓H':'');sp.title=`exit: ${d.exit_ip}  Huawei: ${d.huawei_ok?'OK':'нет'}`;}else{sp.className='tres fail';sp.textContent=d.error||'нет ответа';}}catch(e){sp.className='tres fail';sp.textContent='ошибка';}btn.disabled=false;}
