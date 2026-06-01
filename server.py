@@ -33,7 +33,7 @@ SB_CONF     = CONF_DIR / "singbox.json"
 CERT_FILE   = CONF_DIR / "cert.pem"
 KEY_FILE    = CONF_DIR / "key.pem"
 
-PROXY_PORT  = 8443
+BASE_PORT   = 10000    # порт модема N = BASE_PORT + N
 HOST_OCTET  = 100      # 192.168.N.100 — адрес интерфейса модема на хосте
 SINGBOX_BIN = shutil.which("sing-box") or "/usr/local/bin/sing-box"
 SYSTEMD_SVC = "modlink"
@@ -93,32 +93,33 @@ def load_modems() -> list[Modem]:
 
 # ---------------------------------------------------------------------------
 def gen_singbox_config(modems: list[Modem]) -> dict:
-    users = [{"username": m.username, "password": m.password} for m in modems]
-    outbounds = [
-        {"type": "direct", "tag": m.tag, "inet4_bind_address": m.bind_ip}
-        for m in modems
-    ]
-    rules = [
-        {"auth_user": [m.username], "outbound": m.tag}
-        for m in modems
-    ]
+    """
+    Порт-per-модем: mixed inbound (HTTP CONNECT + SOCKS5) на BASE_PORT + N.
+    Маршрутизация по inbound тегу — изоляция отказов, удобный мониторинг.
+    """
+    inbounds, outbounds, rules = [], [], []
+    for m in modems:
+        port    = BASE_PORT + m.n
+        tag_in  = f"in-{m.n}"
+        tag_out = f"out-{m.n}"
+        inbounds.append({
+            "type": "mixed",
+            "tag": tag_in,
+            "listen": "0.0.0.0",
+            "listen_port": port,
+            "users": [{"username": m.username, "password": m.password}],
+        })
+        outbounds.append({
+            "type": "direct",
+            "tag": tag_out,
+            "inet4_bind_address": m.bind_ip,
+        })
+        rules.append({"inbound": [tag_in], "outbound": tag_out})
     return {
         "log": {"level": "warn", "timestamp": True},
-        "inbounds": [{
-            "type": "http",
-            "listen": "0.0.0.0",
-            "listen_port": PROXY_PORT,
-            "users": users,
-            "tls": {
-                "enabled": True,
-                "certificate_path": str(CERT_FILE),
-                "key_path": str(KEY_FILE),
-            },
-        }],
+        "inbounds": inbounds,
         "outbounds": outbounds,
-        "route": {
-            "rules": rules,
-        },
+        "route": {"rules": rules},
     }
 
 
@@ -218,11 +219,12 @@ def cmd_test(n: int, server_addr: str = "127.0.0.1") -> None:
         sys.exit(f"модем {n} не найден в {MODEMS_CONF}")
     m = m_list[0]
 
-    proxy_url = f"https://{m.username}:{m.password}@{server_addr}:{PROXY_PORT}"
-    curl_base = f"curl -s --max-time 10 --proxy '{proxy_url}' --proxy-insecure"
+    port      = BASE_PORT + m.n
+    proxy_url = f"http://{m.username}:{m.password}@{server_addr}:{port}"
+    curl_base = f"curl -s --max-time 10 --proxy '{proxy_url}'"
 
-    print(f"  модем {m.n}  bind={m.bind_ip}")
-    print(f"  прокси: {server_addr}:{PROXY_PORT}  user={m.username}")
+    print(f"  модем {m.n}  bind={m.bind_ip}  порт={port}")
+    print(f"  прокси: {server_addr}:{port}  user={m.username}")
 
     # exit IP
     r = sh(f"{curl_base} http://ip.me", timeout=15)
@@ -251,7 +253,8 @@ def cmd_show_creds(modems: list[Modem]) -> None:
     print(f"# Строки для /etc/proxyveth/modems.conf на клиенте")
     print(f"# (заменить SERVER_IP на реальный IP этого сервера)")
     for m in modems:
-        print(f"{m.n}  {host}:{PROXY_PORT}:{m.username}:{m.password}")
+        port = BASE_PORT + m.n
+        print(f"{host}:{port}:{m.username}:{m.password}")
 
 
 # ---------------------------------------------------------------------------
