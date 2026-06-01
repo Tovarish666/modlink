@@ -7,7 +7,7 @@ modlink panel — веб-панель управления. Только stdlib,
 from __future__ import annotations
 import argparse, atexit, json, os, random, re, shutil, socket, subprocess
 import sys, time, urllib.request, webbrowser
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -676,7 +676,7 @@ def main() -> None:
     print(f"  modlink panel → {url}")
     if not a.no_browser:
         webbrowser.open(url)
-    server = HTTPServer((a.host, a.port), Handler)
+    server = ThreadingHTTPServer((a.host, a.port), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
