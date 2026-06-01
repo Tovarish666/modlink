@@ -27,11 +27,18 @@ else:
 MODEMS_CONF  = CONF_DIR / "modems.conf"
 SB_CONF      = CONF_DIR / "singbox.json"
 SERVER_CONF  = CONF_DIR / "server.json"
+SB_LOG       = CONF_DIR / "singbox.log"
 CERT_FILE    = CONF_DIR / "certs" / "cert.pem"
 KEY_FILE     = CONF_DIR / "certs" / "key.pem"
 
 def has_tls() -> bool:
     return CERT_FILE.exists() and KEY_FILE.exists()
+
+def read_log(tail: int = 80) -> list[str]:
+    if not SB_LOG.exists():
+        return []
+    lines = SB_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    return lines[-tail:]
 
 DEFAULT_BASE_PORT = 10000
 
@@ -124,14 +131,16 @@ def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -
         port    = base_port + m["n"]
         tag_in  = f"in-{m['n']}"
         tag_out = f"out-{m['n']}"
+        # mixed не поддерживает TLS → http+TLS или mixed без TLS
+        tls = has_tls()
         inbound: dict = {
-            "type": "mixed",
+            "type": "http" if tls else "mixed",
             "tag": tag_in,
             "listen": "0.0.0.0",
             "listen_port": port,
             "users": [{"username": f"modem{m['n']}", "password": m["password"]}],
         }
-        if has_tls():
+        if tls:
             inbound["tls"] = {"enabled": True,
                               "certificate_path": str(CERT_FILE),
                               "key_path": str(KEY_FILE)}
@@ -165,12 +174,17 @@ def apply_singbox(modems: list[dict], base_port: int) -> tuple[bool, str]:
             _sb_proc.terminate()
             try: _sb_proc.wait(timeout=5)
             except subprocess.TimeoutExpired: _sb_proc.kill()
+        log_fh = open(SB_LOG, "w", encoding="utf-8")
         _sb_proc = subprocess.Popen(
             [str(SINGBOX_BIN), "run", "-c", str(SB_CONF)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1)
+            stdout=log_fh, stderr=log_fh)
+        time.sleep(2)
         ok = _sb_proc.poll() is None
-        return ok, ("active" if ok else "crashed")
+        log_fh.flush()
+        if not ok:
+            err = strip_ansi("\n".join(read_log(20)))
+            return False, err or "crashed (no output)"
+        return True, "active"
     else:
         r2 = subprocess.run("systemctl restart modlink",
                             shell=True, capture_output=True, text=True, timeout=30)
@@ -234,6 +248,9 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/modems":
             self._json(load_modems())
+
+        elif path == "/api/logs":
+            self._json({"lines": read_log(100)})
 
         elif path == "/api/external-ip":
             ip = fetch_external_ip()
@@ -378,6 +395,15 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
 .spin{display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:rot .6s linear infinite}
 @keyframes rot{to{transform:rotate(360deg)}}
 .empty{text-align:center;padding:36px;color:var(--muted);font-size:13px}
+
+/* log modal */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);width:min(860px,95vw);max-height:80vh;display:flex;flex-direction:column}
+.modal-hdr{display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border);gap:8px}
+.modal-hdr h3{font-size:14px;font-weight:600;flex:1;color:#fff}
+.log-body{flex:1;overflow-y:auto;padding:12px 16px;font-family:monospace;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:var(--text);background:var(--bg)}
+.log-body .err{color:var(--error)}.log-body .warn{color:var(--warn,#d29922)}.log-body .ok{color:var(--success)}
 </style>
 </head>
 <body>
@@ -419,12 +445,26 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
 
   <div class="bar">
     <button class="btn" onclick="addRow()">+ Добавить</button>
+    <button class="btn" onclick="openLogs()" style="color:var(--muted)">≡ Логи</button>
     <div class="bar-right">
       <button class="btn" onclick="copyClient()">⎘&nbsp;Скопировать</button>
       <button class="btn btn-primary" id="applyBtn" onclick="doApply()">Применить</button>
     </div>
   </div>
 </div>
+
+<!-- log modal -->
+<div class="modal-overlay" id="logModal" onclick="if(event.target===this)closeLogs()">
+  <div class="modal">
+    <div class="modal-hdr">
+      <h3>≡ sing-box logs</h3>
+      <button class="btn btn-sm" onclick="refreshLogs()">⟳ Обновить</button>
+      <button class="btn btn-sm" onclick="closeLogs()">✕</button>
+    </div>
+    <div class="log-body" id="logBody">Загрузка…</div>
+  </div>
+</div>
+
 <div class="toasts" id="toasts"></div>
 
 <script>
@@ -602,6 +642,22 @@ function copyClient(){
       document.body.appendChild(ta);ta.select();document.execCommand('copy');
       ta.remove();toast(`Скопировано ${lines.length} строк`,'ok');});
 }
+
+async function refreshLogs(){
+  const el=document.getElementById('logBody');
+  try{
+    const d=await fetch('/api/logs').then(r=>r.json());
+    if(!d.lines||!d.lines.length){el.textContent='(лог пуст)';return;}
+    el.innerHTML=d.lines.map(l=>{
+      const cls=l.match(/FATAL|ERROR|error/i)?'err':l.match(/WARN/i)?'warn':l.match(/INFO.*started|active/i)?'ok':'';
+      const safe=l.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+      return cls?`<span class="${cls}">${safe}</span>`:safe;
+    }).join('\n');
+    el.scrollTop=el.scrollHeight;
+  }catch(e){el.textContent='Ошибка загрузки логов';}
+}
+function openLogs(){document.getElementById('logModal').classList.add('open');refreshLogs();}
+function closeLogs(){document.getElementById('logModal').classList.remove('open');}
 
 loadInfo();loadModems();
 setInterval(loadInfo,8000);
