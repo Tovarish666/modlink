@@ -1,135 +1,100 @@
-# ProxyVethLab
+# modlink
 
-**Экспериментальный rewrite адаптера `proxyveth`. Болванка. В прод не ставить.**
+Turn remote modems into local network interfaces via HTTPS proxy.
 
-Отдельная песочница — рабочий `Tovarish666/ProxyControlService` не трогаем.
+Each modem on a remote server (MSK/SPB) becomes a virtual eth interface on the target machine — with the same `192.168.N.1` gateway address and Huawei web-API accessible transparently through HTTP CONNECT.
 
-## Что это и зачем
+Transport: **sing-box HTTPS proxy** (TLS, Basic Auth per modem). No VPN protocols.
 
-Каждый удалённый SOCKS5-прокси (ведущий к модему Huawei в СПб) представляем на
-VM в Казахстане как **локальный «модем»** — интерфейс `ethN` с адресом
-`192.168.N.100` — так, чтобы немодифицированный софт **mobileproxy.space**
-работал, будто модем воткнут физически по USB.
+---
 
-Обе плоскости одного модема идут в **одну и ту же проксю**:
+## Components
 
-| плоскость   | адрес на VM       | путь                                              |
-|-------------|-------------------|---------------------------------------------------|
-| данные      | `192.168.N.100`   | → прокся → 3proxy(СПб) → модем → интернет          |
-| управление  | `192.168.N.1`     | → та же прокся → 3proxy `connect` к своему шлюзу `.1` (веб/API модема) |
+| File | Role |
+|---|---|
+| `server.py` | Runs on the **remote host** (where modems are). Starts sing-box as HTTPS proxy. |
+| `panel.py`  | Web UI for managing modems. Works on Linux (systemd) and Windows 10+. |
+| `deploy-win.ps1` | One-shot setup for Windows 10: Python, Flask, sing-box, TLS cert. |
 
-`.100 ↔ .1` — жёсткая связка mobileproxy, менять нельзя.
+---
 
-## Решения этой сессии (отличия от рабочего proxyveth.py)
-
-1. **Интерфейс `ethN`, не `veth`.** Скрипты mobileproxy распознают `ethN`+`.100`
-   как модем (`setup-modem-management.sh`, `is_usb_modem`, стр. 792–795);
-   `veth*` они **игнорируют** (стр. 772) — то есть как `veth` интерфейс для
-   системы «невидимый модем».
-2. **Таблица маршрутов = `100+N`** — совпадает с конвенцией mobileproxy
-   (`99 + (N+1)`). Поэтому cron-сторож `check-routes.sh` (раз в 1–2 мин)
-   **коэкзистирует**, а не конфликтует: видит наше правило `from .100` и
-   непустую таблицу → ничего не трогает (стр. 907–914). Бонус: его rp_filter-петля
-   (стр. 956–966) сама держит `rp_filter=0` на `ethN`.
-3. **DNS на VM.** Per-netns `resolv.conf` → резолвер на стороне VM
-   (`192.168.N.100`, host-конец veth). На модем за DNS не ходим (курица-яйцо:
-   без локального DNS до модема не достучаться). Минус — DNS резолвится из
-   Казахстана (гео-несовпадение); принято осознанно.
-4. **Дисциплина жизненного цикла:** интерфейс существует ⇒ настроен **полностью**.
-   На `down` убираем целиком, чтобы сторож не поймал полу-состояние и не дёргал
-   DHCP по мёртвому `ethN`.
-5. **Bypass свят:** `proxy_host` — **всегда** напрямую через WAN, никогда в тоннель
-   (иначе петля). DNS-резолвер — линк-локально к host-концу, тоже мимо тоннеля.
-6. **Фенсинг `ethN`** от `systemd-networkd` / NetworkManager (`Unmanaged`), чтобы
-   они не подняли DHCP и не переназначили адрес.
-
-## Транспорт: sing-box
-
-Движок socks5→tun — **sing-box** (по одному инстансу на netns).
-
-- **Супервизия — systemd-шаблон** `proxyveth-singbox@N.service` с
-  `NetworkNamespacePath=/run/netns/ns_N` → sing-box крутится **внутри netns**,
-  `Restart=always`. Заменяет `nohup`+`pkill watchdog` старого кода.
-- `auto_route: false` — маршрутами рулим МЫ (`ip rule`/`ip route`), sing-box их не трогает.
-- `stack: "system"` — легче, чем gVisor у tun2socks (важно при 100 инстансах).
-- **UDP → `action: reject` (method default)** — ICMP unreachable, поэтому QUIC
-  **быстро падает на TCP** (старый silent `iptables DROP` вешал ожиданием), и UDP
-  **не уходит в socks** → не флудим и не убиваем 3proxy. Лечит обе стороны старой болезни.
-- sing-box сам создаёт и адресует `tunN` (`10.0.N.1/30`); мы только добавляем
-  `default dev tunN` и `192.168.N.1/32 dev tunN` (управление модемом) ПОСЛЕ старта.
-- `mtu: 1500` — knob. При зависании КРУПНЫХ передач пробовать `1400`,
-  но это **не первый подозреваемый** (история: 20ч по MTU оказались тупиком,
-  тест-сайты 2ip/cloudflare сами висят на мобильных IP).
-
-### DNS — почему reject UDP его не ломает (ПОДТВЕРЖДЕНО кодом mproxy)
-
-Прочитан `mproxy/lib/dns-cache.js` + `proxy-socks5.js`/`proxy-http.js`:
-- mproxy резолвит хост **сам**, потом `net.createConnection({host: targetIp,
-  localAddress: outgoingIp(.100)})` — коннект к УЖЕ резолвнутому IP. Чейнинга в
-  upstream-socks нет (remote-DNS нет).
-- Цепочка резолва (`dns-cache.js`): `admIp(.1)` → `1.1.1.1` → `8.8.8.8` (UDP, 3с)
-  → системный резолвер → **DoH (TCP/443)**. Ни один резолвер **не биндится к `.100`**
-  (`dns.Resolver` не умеет localAddress) → DNS уходит с дефолтного адреса хоста
-  **через WAN напрямую, НЕ через tun**.
-
-Следствия: `reject UDP` в sing-box **DNS не трогает** (он не в тоннеле); DNS
-по факту резолвится **на VM** (через `1.1.1.1`/DoH) — как и хотели. Per-netns
-`resolv.conf` для mproxy **не нужен**. Мелочь на потом: запрос к `admIp(.1)`
-у нас всегда отваливается по 3с-таймауту → **+3с на каждый новый хост** до кэша
-(можно убрать, не передавая `.1` как DNS-сервер).
-
-Клиентский **UDP (SOCKS5 associate)** — `proxy-socks5.js:626` биндит `.100`, т.е.
-он **входит в тоннель** и ловится нашим `reject` (это и есть бывший убийца 3proxy —
-теперь чисто отбивается).
-
-## Открытые вопросы (решаем дальше)
-
-- **Плоскость управления `.1` — ГЛАВНЫЙ открытый риск.** mproxy шлёт запросы к
-  Huawei API НЕ с `.100`: `modem-handlers.js:329` создаёт `new Huawei_auth(baseURL)`
-  без `localAddress` → запрос идёт с дефолтного адреса хоста → main-таблица →
-  connected-route `192.168.N.0/24 dev ethN` → ARP `.1` → **никто не отвечает**
-  (наш конец `.254`). В физической установке `.1` отвечает (модем реально там),
-  у нас — нет. **Кандидат-фикс (проверить на VM):** host-маршрут
-  `ip route add 192.168.N.1/32 via 192.168.N.254 dev ethN` + форвардинг/NAT в ns,
-  чтобы host→`.1` уходил в тоннель. НЕ хардкодим вслепую — сначала тест на VM.
-- **rp_filter:** `net.ipv4.conf.all.rp_filter` ставит `install.sh` mobileproxy в `1`;
-  влияние понижения до `2` (loose) на остальной хост — проверить.
-
-## Что НЕЛЬЗЯ трогать (соседство с mobileproxy)
-
-- `rt_tables` id `100–299` — заявлены mobileproxy (`modem1..modem200`). Совпадаем
-  по id осознанно, не затираем чужое.
-- WAN-дефолт хоста — под охраной `eth0-default-route.service` + дедупа сторожа;
-  это в нашу пользу (нужно для bypass).
-- Имя `ethN` — менять нельзя, иначе сломается либо распознавание модема, либо
-  коэкзистенция со сторожем.
-
-## Статус
-
-`run()`/`up`/`down` по умолчанию **dry-run** (печатают план); реально — флаг `--apply`.
-`check`/`status` — read-only, выполняются всегда.
-
-Реализовано: `bring_up`/`tear_down`, `start_transport` (sing-box: конфиг + systemd),
-`fence_iface` (NM + networkd Unmanaged), `write_netns_resolv`, загрузка модемов из
-`/etc/proxyveth/modems.conf`, `check` (exit IP + Huawei .1 + sing-box), `status`.
-Заглушки: `sync` (Google Sheets), `watchdog`.
-
-## Деплой и тест (experimental)
-
-На ЧИСТОЙ Ubuntu (десктоп с GUI = NetworkManager — `fence_iface` это учитывает):
+## Remote server setup (Linux)
 
 ```bash
-sudo bash deploy.sh                      # пакеты + sing-box + proxyveth + sysctl
-sudo nano /etc/proxyveth/modems.conf     # строка: N host:port:login:password (N = явный номер модема)
-proxyveth up 1                           # dry-run: посмотреть план
-sudo proxyveth up 1 --apply              # поднять модем 1 (eth1 @ 192.168.1.100)
-sudo proxyveth check 1                   # exit IP (.100) + Huawei .1 + sing-box
-sudo proxyveth down 1 --apply            # снять
+# 1. Install sing-box
+bash <(curl -fsSL https://sing-box.app/installer.sh)
+
+# 2. Get scripts
+curl -fsSL https://raw.githubusercontent.com/Tovarish666/modlink/main/server.py \
+  -o /usr/local/bin/modlink-server && chmod +x /usr/local/bin/modlink-server
+
+curl -fsSL https://raw.githubusercontent.com/Tovarish666/modlink/main/panel.py \
+  -o /usr/local/bin/modlink-panel && chmod +x /usr/local/bin/modlink-panel
+
+# 3. Create modem list
+mkdir -p /etc/modlink
+cat > /etc/modlink/modems.conf << 'EOF'
+# N  password
+4   abc123def4
+41  xyz987mnpq
+EOF
+
+# 4. Apply + verify
+modlink-server apply
+modlink-server status
+modlink-server test 4
 ```
 
-**Что проверяем:**
-- `exit IP (.100)` = мобильный IP СПб → **данные через тоннель работают**.
-- `Huawei .1` через `.100` → тоннель до веб-морды модема (curl биндит `.100`, поэтому
-  должно идти в тоннель; это НЕ тест mproxy-mgmt — тот не биндит `.100`, см. риск выше).
-- если exit IP пуст/таймаут на ipify — пробуй `curl --interface 192.168.1.100 -I https://www.google.com`
-  (мёртвые тест-сайты на мобильных IP — известный ложный сигнал).
+**Or use the web panel:**
+
+```bash
+pip install flask
+modlink-panel          # → http://localhost:5000
+```
+
+---
+
+## Windows 10 setup (temporary)
+
+```powershell
+# Run PowerShell as Administrator:
+Set-ExecutionPolicy Bypass -Scope Process
+irm https://raw.githubusercontent.com/Tovarish666/modlink/main/deploy-win.ps1 | iex
+```
+
+Opens panel at `http://localhost:5000` automatically.
+
+---
+
+## modems.conf format
+
+```
+# /etc/modlink/modems.conf  (Linux)
+# %ProgramData%\modlink\modems.conf  (Windows)
+#
+# N  password
+# N = modem number = third octet of 192.168.N.x
+4   abc123def4
+41  xyz987mnpq
+```
+
+Passwords are auto-generated if omitted.
+
+---
+
+## How gateway emulation works
+
+The remote server runs sing-box with L2 access to `192.168.N.1` (Huawei router).  
+A client doing `CONNECT 192.168.N.1:80` through the proxy gets transparently forwarded to the real device — no VPN, plain HTTP CONNECT.
+
+---
+
+## Client modems.conf format
+
+After running `⎘ Copy` in the panel:
+
+```
+N  SERVER_IP:8443:modem-N:password
+```
+
+Paste into the client-side `modems.conf`.
