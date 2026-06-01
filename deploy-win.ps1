@@ -145,7 +145,7 @@ if (-not (Test-Path $modemsConf)) {
     Ok "Создан пустой modems.conf — добавь модемы через панель"
 }
 
-# ── 8. Ярлык запуска ──────────────────────────────────────────────────────
+# ── 8. Ярлык ручного запуска ──────────────────────────────────────────────
 $startBat = "$MODLINK_DIR\start.bat"
 @"
 @echo off
@@ -157,17 +157,71 @@ pause
 "@ | Out-File $startBat -Encoding ASCII
 Ok "Ярлык: $startBat"
 
+# ── 9. Автозапуск через Task Scheduler ────────────────────────────────────
+$TASK_NAME = "modlink-panel"
+$pyPath    = (Get-Command $py -ErrorAction SilentlyContinue).Source
+
+if ($pyPath) {
+    Info "Регистрирую задачу автозапуска '$TASK_NAME'…"
+    try {
+        # Удалить старую задачу если есть
+        Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false -ErrorAction SilentlyContinue
+
+        $action   = New-ScheduledTaskAction `
+                        -Execute $pyPath `
+                        -Argument "$MODLINK_DIR\panel.py --port $PANEL_PORT --host 127.0.0.1 --no-browser" `
+                        -WorkingDirectory $MODLINK_DIR
+        $trigger  = New-ScheduledTaskTrigger -AtStartup
+        $settings = New-ScheduledTaskSettingsSet `
+                        -ExecutionTimeLimit 0 `
+                        -RestartCount 3 `
+                        -RestartInterval (New-TimeSpan -Minutes 1)
+        $principal = New-ScheduledTaskPrincipal `
+                        -UserId "SYSTEM" `
+                        -LogonType ServiceAccount `
+                        -RunLevel Highest
+
+        Register-ScheduledTask `
+            -TaskName $TASK_NAME `
+            -Action $action `
+            -Trigger $trigger `
+            -Settings $settings `
+            -Principal $principal | Out-Null
+
+        Ok "Задача '$TASK_NAME' зарегистрирована (запуск при старте системы)"
+    } catch {
+        Warn "Не удалось зарегистрировать задачу: $_"
+        Warn "Используй $startBat для ручного запуска"
+    }
+} else {
+    Warn "Путь к Python не определён — автозапуск не настроен. Используй $startBat"
+}
+
 # ── Итог ──────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "=== Готово ===" -ForegroundColor Green
 Write-Host "  Директория:   $MODLINK_DIR"
 Write-Host "  Конфиги:      $CONF_DIR"
-Write-Host "  Запуск:       $startBat"
-Write-Host "  или вручную:  $py $MODLINK_DIR\panel.py --port $PANEL_PORT"
+Write-Host "  Автозапуск:   Task Scheduler → '$TASK_NAME'"
+Write-Host "  Ручной запуск: $startBat"
+Write-Host "  Панель:       http://localhost:$PANEL_PORT"
+Write-Host ""
+Write-Host "  Управление сервисом:"
+Write-Host "    Старт:  Start-ScheduledTask  -TaskName '$TASK_NAME'"
+Write-Host "    Стоп:   Stop-ScheduledTask   -TaskName '$TASK_NAME'"
+Write-Host "    Статус: Get-ScheduledTask    -TaskName '$TASK_NAME' | Select-Object TaskName,State"
 Write-Host ""
 
 $ans = Read-Host "Запустить панель сейчас? [Y/n]"
 if ($ans -notmatch "^[nN]") {
-    Start-Process "http://localhost:$PANEL_PORT"
-    & $py "$MODLINK_DIR\panel.py" --port $PANEL_PORT
+    # Запустить через планировщик (или напрямую если планировщик не сработал)
+    try {
+        Start-ScheduledTask -TaskName $TASK_NAME -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        Start-Process "http://localhost:$PANEL_PORT"
+        Ok "Панель запущена через планировщик → http://localhost:$PANEL_PORT"
+    } catch {
+        Start-Process "http://localhost:$PANEL_PORT"
+        & $py "$MODLINK_DIR\panel.py" --port $PANEL_PORT
+    }
 }

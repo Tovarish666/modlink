@@ -50,10 +50,22 @@ def save_server_conf(conf: dict) -> None:
     SERVER_CONF.write_text(json.dumps(conf, indent=2), encoding="utf-8")
 
 def fetch_external_ip() -> str:
-    for url in ("http://ip.me", "https://api.ipify.org", "http://checkip.amazonaws.com"):
+    candidates = [
+        ("https://api.ipify.org",          {}),
+        ("https://api4.ipify.org",         {}),
+        ("http://checkip.amazonaws.com",   {}),
+        ("http://ip.me",                   {"Accept": "text/plain",
+                                            "User-Agent": "curl/7.68.0"}),
+    ]
+    for url, headers in candidates:
         try:
-            with urllib.request.urlopen(url, timeout=6) as r:
-                return r.read().decode().strip()
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as r:
+                ip = r.read().decode().strip()
+            # убеждаемся что получили IP, а не HTML
+            parts = ip.split(".")
+            if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+                return ip
         except Exception:
             continue
     return ""
