@@ -44,17 +44,9 @@ if (-not $py) {
 }
 Ok "Python: $( & $py --version 2>&1 )"
 
-# ── 2. Flask ───────────────────────────────────────────────────────────────
-Info "pip install flask…"
-$pipOk = $false
-foreach ($attempt in 1..3) {
-    & $py -m pip install flask --quiet --disable-pip-version-check --timeout 60 --retries 3
-    if ($LASTEXITCODE -eq 0) { $pipOk = $true; break }
-    Warn "Попытка $attempt не удалась, повтор…"
-    Start-Sleep -Seconds 5
-}
-if (-not $pipOk) { Abort "pip install flask завершился с ошибкой. Проверь интернет и попробуй ещё раз." }
-Ok "flask OK"
+# ── 2. Зависимости ────────────────────────────────────────────────────────
+# panel.py использует только stdlib — pip не нужен
+Ok "зависимости: только stdlib (pip не нужен)"
 
 # ── 3. Директории ──────────────────────────────────────────────────────────
 Info "Создаю директории…"
