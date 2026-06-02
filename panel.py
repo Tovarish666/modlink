@@ -170,10 +170,14 @@ def apply_singbox(modems: list[dict], base_port: int) -> tuple[bool, str]:
         return False, strip_ansi((r.stderr or r.stdout).strip())
     if IS_WIN:
         global _sb_proc
+        # убить и отслеживаемый процесс, и любые осиротевшие sing-box.exe
         if _sb_proc and _sb_proc.poll() is None:
             _sb_proc.terminate()
-            try: _sb_proc.wait(timeout=5)
+            try: _sb_proc.wait(timeout=3)
             except subprocess.TimeoutExpired: _sb_proc.kill()
+        subprocess.run(["taskkill", "/F", "/IM", "sing-box.exe"],
+                       capture_output=True, text=True)
+        time.sleep(0.5)
         log_fh = open(SB_LOG, "w", encoding="utf-8")
         _sb_proc = subprocess.Popen(
             [str(SINGBOX_BIN), "run", "-c", str(SB_CONF)],
