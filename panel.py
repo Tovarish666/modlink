@@ -954,10 +954,11 @@ function copyClient(){
   const rows=getRows();
   if(!rows.length){toast('Нет модемов','err');return;}
   const ip=document.getElementById('extIp').value.trim()||localIp;
+  // формат: IP:PORT:login:pass \t http://IP:RECONN/reconnect
   const lines=rows.map(m=>{
     const mp=m._mp||'?';
     const ru=m._ru||'?';
-    return `${ip}:${mp}:modem${m.n}:${m.password}\\t${ip}:${mp}:modem${m.n}:${m.password}\\t${ru}`;
+    return `${ip}:${mp}:modem${m.n}:${m.password}\\t${ru}`;
   });
   const text=lines.join('\\n');
   navigator.clipboard.writeText(text)
