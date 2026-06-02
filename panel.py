@@ -657,7 +657,7 @@ async function refreshLogs(){
       const cls=l.match(/FATAL|ERROR|error/i)?'err':l.match(/WARN/i)?'warn':l.match(/INFO.*started|active/i)?'ok':'';
       const safe=l.replace(/&/g,'&amp;').replace(/</g,'&lt;');
       return cls?`<span class="${cls}">${safe}</span>`:safe;
-    }).join('\n');
+    }).join('\\n');
     el.scrollTop=el.scrollHeight;
   }catch(e){el.textContent='Ошибка загрузки логов';}
 }
