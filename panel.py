@@ -6,7 +6,8 @@ modlink panel — веб-панель управления. Только stdlib,
 """
 from __future__ import annotations
 import argparse, atexit, json, os, random, re, shutil, socket, subprocess
-import sys, time, urllib.request, webbrowser
+import sys, threading, time, urllib.request, webbrowser
+from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
@@ -30,6 +31,7 @@ SERVER_CONF  = CONF_DIR / "server.json"
 SB_LOG       = CONF_DIR / "singbox.log"
 CERT_FILE    = CONF_DIR / "certs" / "cert.pem"
 KEY_FILE     = CONF_DIR / "certs" / "key.pem"
+LOG_DIR      = CONF_DIR / "logs"
 
 def has_tls() -> bool:
     return CERT_FILE.exists() and KEY_FILE.exists()
@@ -74,7 +76,6 @@ def fetch_external_ip() -> str:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=6) as r:
                 ip = r.read().decode().strip()
-            # убеждаемся что получили IP, а не HTML
             parts = ip.split(".")
             if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
                 return ip
@@ -112,19 +113,220 @@ def load_modems() -> list[dict]:
             n = int(parts[0])
         except (ValueError, IndexError):
             continue
-        result.append({"n": n, "password": parts[1] if len(parts) > 1 else rand_pass()})
+        interval_min = 0
+        if len(parts) > 2:
+            try:
+                interval_min = int(parts[2])
+            except ValueError:
+                pass
+        result.append({
+            "n": n,
+            "password": parts[1] if len(parts) > 1 else rand_pass(),
+            "interval_min": interval_min,
+        })
     return sorted(result, key=lambda x: x["n"])
 
 def save_modems(modems: list[dict]) -> None:
     CONF_DIR.mkdir(parents=True, exist_ok=True)
-    lines = [f"{m['n']}  {m['password']}" for m in sorted(modems, key=lambda x: x["n"])]
+    lines = []
+    for m in sorted(modems, key=lambda x: x["n"]):
+        line = f"{m['n']}  {m['password']}"
+        mins = m.get("interval_min", 0)
+        if mins:
+            line += f"  {mins}"
+        lines.append(line)
     MODEMS_CONF.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+# ---------------------------------------------------------------------------
+# Huawei HiLink API helpers (urllib only, no pip)
+# ---------------------------------------------------------------------------
+def _http_xml_get(url: str, headers: dict | None = None, timeout: int = 8) -> str:
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+def _http_xml_post(url: str, xml_body: str, headers: dict, timeout: int = 8) -> str:
+    req = urllib.request.Request(url, data=xml_body.encode("utf-8"), headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+def _get_huawei_token(base_url: str, timeout: int = 8) -> tuple[str, str]:
+    txt = _http_xml_get(base_url + "/api/webserver/SesTokInfo", timeout=timeout)
+    ses = re.search(r"<SesInfo>([^<]+)</SesInfo>", txt)
+    tok = re.search(r"<TokInfo>([^<]+)</TokInfo>", txt)
+    if not ses or not tok:
+        raise RuntimeError("SesTokInfo parse failed")
+    return tok.group(1), ses.group(1)  # token, cookie
+
+def _huawei_post(base_url: str, path: str, xml: str,
+                 token: str, cookie: str, timeout: int = 8) -> None:
+    _http_xml_post(
+        base_url + path, xml,
+        {"__RequestVerificationToken": token,
+         "Cookie": cookie,
+         "Content-Type": "text/xml; charset=UTF-8"},
+        timeout=timeout,
+    )
+
+# ---------------------------------------------------------------------------
+# Reconnect E3372 (toggle data switch + LTE band cycle — gives new IP)
+# ---------------------------------------------------------------------------
+def reconnect_e3372h(webui_ip: str, timeout: int = 8) -> tuple[bool, str]:
+    base = f"http://{webui_ip}"
+
+    def set_net_mode(mode: str, lte_band: str) -> None:
+        tok, ck = _get_huawei_token(base, timeout)
+        _huawei_post(base, "/api/net/net-mode",
+                     "<?xml version='1.0' encoding='UTF-8'?>"
+                     "<request>"
+                     f"<NetworkMode>{mode}</NetworkMode>"
+                     "<NetworkBand>3FFFFFFF</NetworkBand>"
+                     f"<LTEBand>{lte_band}</LTEBand>"
+                     "</request>",
+                     tok, ck, timeout)
+
+    try:
+        tok, ck = _get_huawei_token(base, timeout)
+        _huawei_post(base, "/api/dialup/mobile-dataswitch",
+                     "<?xml version='1.0' encoding='UTF-8'?>"
+                     "<request><dataswitch>0</dataswitch></request>",
+                     tok, ck, timeout)
+        time.sleep(2.0)
+
+        set_net_mode("00", "5");                time.sleep(2.0)
+        set_net_mode("02", "5");                time.sleep(0.5)
+        set_net_mode("03", "7FFFFFFFFFFFFFFF"); time.sleep(0.8)
+
+        tok, ck = _get_huawei_token(base, timeout)
+        _huawei_post(base, "/api/dialup/mobile-dataswitch",
+                     "<?xml version='1.0' encoding='UTF-8'?>"
+                     "<request><dataswitch>1</dataswitch></request>",
+                     tok, ck, timeout)
+
+        for _ in range(20):
+            time.sleep(0.4)
+            try:
+                req = urllib.request.Request(
+                    base + "/api/dialup/mobile-dataswitch",
+                    headers={"Cookie": ck})
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    if "<dataswitch>1</dataswitch>" in r.read().decode("utf-8", errors="replace"):
+                        return True, "reconnected"
+            except Exception:
+                pass
+        return False, "dataswitch not confirmed"
+    except Exception as e:
+        return False, str(e)
+
+# ---------------------------------------------------------------------------
+# Full device reboot via Huawei API
+# ---------------------------------------------------------------------------
+def reboot_huawei(webui_ip: str, timeout: int = 8) -> tuple[bool, str]:
+    base = f"http://{webui_ip}"
+    try:
+        tok, ck = _get_huawei_token(base, timeout)
+        _huawei_post(base, "/api/device/control",
+                     "<?xml version='1.0' encoding='UTF-8'?>"
+                     "<request><Control>1</Control></request>",
+                     tok, ck, timeout)
+        return True, "reboot sent"
+    except Exception as e:
+        return False, str(e)
+
+# ---------------------------------------------------------------------------
+# Reconnect log
+# ---------------------------------------------------------------------------
+_log_locks: dict[int, threading.Lock] = {}
+
+def _now_strs() -> tuple[str, str]:
+    utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    loc = datetime.now().astimezone().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+    return utc, loc
+
+def append_reconnect_log(n: int, line: str) -> None:
+    lock = _log_locks.setdefault(n, threading.Lock())
+    log_path = LOG_DIR / f"modem{n}_reconnect.txt"
+    with lock:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        if log_path.exists() and log_path.stat().st_size > 5 * 1024 * 1024:
+            try:
+                log_path.rename(str(log_path) + ".1")
+            except Exception:
+                pass
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+def read_reconnect_log(n: int, tail: int = 60) -> list[str]:
+    log_path = LOG_DIR / f"modem{n}_reconnect.txt"
+    if not log_path.exists():
+        return []
+    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return lines[-tail:]
+
+# ---------------------------------------------------------------------------
+# Interval scheduler (auto-reconnect by timer)
+# ---------------------------------------------------------------------------
+class IntervalJob:
+    def __init__(self, n: int, interval_sec: int):
+        self.n = n
+        self.interval = max(60, int(interval_sec))
+        self._stop = threading.Event()
+        self._thr = threading.Thread(target=self._run, daemon=True,
+                                     name=f"timer-mdm{n}")
+
+    def start(self) -> None:
+        print(f"[timer] modem{self.n} auto-reconnect every {self.interval}s")
+        self._thr.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        next_at = time.time() + self.interval
+        while not self._stop.is_set():
+            wait = max(0.0, next_at - time.time())
+            if self._stop.wait(wait):
+                break
+            t0 = time.perf_counter()
+            webui_ip = f"192.168.{self.n}.1"
+            ok, msg = reconnect_e3372h(webui_ip)
+            dt = time.perf_counter() - t0
+            utc_s, loc_s = _now_strs()
+            line = (f"{utc_s} | {loc_s} | modem{self.n} | auto "
+                    f"| {dt:.2f}s | {'ok' if ok else 'fail'} | {msg}")
+            append_reconnect_log(self.n, line)
+            print(f"[timer] modem{self.n} -> {'ok' if ok else 'fail'} in {dt:.2f}s | {msg}")
+            next_at += self.interval
+
+
+_jobs: dict[int, IntervalJob] = {}
+_jobs_lock = threading.Lock()
+
+def rebuild_scheduler(modems: list[dict]) -> None:
+    wanted: dict[int, int] = {}
+    for m in modems:
+        mins = m.get("interval_min", 0)
+        if mins and int(mins) > 0:
+            wanted[m["n"]] = int(mins) * 60
+
+    with _jobs_lock:
+        for n in list(_jobs):
+            if n not in wanted or _jobs[n].interval != wanted[n]:
+                _jobs[n].stop()
+                del _jobs[n]
+        for n, sec in wanted.items():
+            if n not in _jobs:
+                job = IntervalJob(n, sec)
+                _jobs[n] = job
+                job.start()
+
+# ---------------------------------------------------------------------------
 def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -> dict:
     """
     Диапазон портов: каждый модем N слушает на BASE_PORT + N.
     Тип mixed — один порт обслуживает HTTP CONNECT и SOCKS5.
     Маршрутизация по inbound тегу (не auth_user) — чище и надёжнее.
+    DNS-секция нужна для корректного HTTPS CONNECT через HTTP-прокси.
     """
     inbounds, outbounds, rules = [], [], []
     for m in modems:
@@ -151,11 +353,21 @@ def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -
             "inet4_bind_address": f"192.168.{m['n']}.100",
         })
         rules.append({"inbound": [tag_in], "outbound": tag_out})
+
+    outbounds.append({"type": "direct", "tag": "direct"})
+
     return {
         "log": {"level": "warn", "timestamp": True},
+        "dns": {
+            "servers": [{"tag": "dns-cf", "address": "1.1.1.1"}],
+            "final": "dns-cf",
+        },
         "inbounds": inbounds,
         "outbounds": outbounds,
-        "route": {"rules": rules},
+        "route": {
+            "rules": rules,
+            "final": "direct",
+        },
     }
 
 def apply_singbox(modems: list[dict], base_port: int) -> tuple[bool, str]:
@@ -170,7 +382,6 @@ def apply_singbox(modems: list[dict], base_port: int) -> tuple[bool, str]:
         return False, strip_ansi((r.stderr or r.stdout).strip())
     if IS_WIN:
         global _sb_proc
-        # убить и отслеживаемый процесс, и любые осиротевшие sing-box.exe
         if _sb_proc and _sb_proc.poll() is None:
             _sb_proc.terminate()
             try: _sb_proc.wait(timeout=3)
@@ -200,6 +411,7 @@ def apply_singbox(modems: list[dict], base_port: int) -> tuple[bool, str]:
 if IS_WIN:
     atexit.register(lambda: _sb_proc.terminate()
                     if _sb_proc and _sb_proc.poll() is None else None)
+atexit.register(lambda: [j.stop() for j in list(_jobs.values())])
 
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -289,6 +501,48 @@ class Handler(BaseHTTPRequestHandler):
                 shell=True, capture_output=True, text=True, timeout=10)
             self._json({"n": n, "exit_ip": exit_ip,
                         "huawei_ok": "SesInfo" in (r2.stdout or "")})
+
+        elif path.startswith("/api/reconnect/"):
+            try:
+                n = int(path.split("/")[-1])
+            except ValueError:
+                return self._json({"error": "invalid N"}, 400)
+            modems = load_modems()
+            if not any(x["n"] == n for x in modems):
+                return self._json({"error": f"modem {n} not found"}, 404)
+            webui_ip = f"192.168.{n}.1"
+            t0 = time.perf_counter()
+            ok, msg = reconnect_e3372h(webui_ip)
+            dt = time.perf_counter() - t0
+            utc_s, loc_s = _now_strs()
+            line = (f"{utc_s} | {loc_s} | modem{n} | manual "
+                    f"| {dt:.2f}s | {'ok' if ok else 'fail'} | {msg}")
+            append_reconnect_log(n, line)
+            self._json({"ok": ok, "msg": msg, "dt": round(dt, 2)})
+
+        elif path.startswith("/api/reboot/"):
+            try:
+                n = int(path.split("/")[-1])
+            except ValueError:
+                return self._json({"error": "invalid N"}, 400)
+            modems = load_modems()
+            if not any(x["n"] == n for x in modems):
+                return self._json({"error": f"modem {n} not found"}, 404)
+            webui_ip = f"192.168.{n}.1"
+            ok, msg = reboot_huawei(webui_ip)
+            utc_s, loc_s = _now_strs()
+            line = (f"{utc_s} | {loc_s} | modem{n} | reboot "
+                    f"| {'ok' if ok else 'fail'} | {msg}")
+            append_reconnect_log(n, line)
+            self._json({"ok": ok, "msg": msg})
+
+        elif path.startswith("/api/reconnect-log/"):
+            try:
+                n = int(path.split("/")[-1])
+            except ValueError:
+                return self._json({"error": "invalid N"}, 400)
+            self._json({"lines": read_reconnect_log(n)})
+
         else:
             self._json({"error": "not found"}, 404)
 
@@ -302,7 +556,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "нет модемов"}, 400)
             try:
                 parsed = [{"n": int(m["n"]),
-                           "password": str(m["password"]).strip()} for m in modems]
+                           "password": str(m["password"]).strip(),
+                           "interval_min": int(m.get("interval_min") or 0)} for m in modems]
             except (KeyError, ValueError) as e:
                 return self._json({"ok": False, "error": str(e)}, 400)
             sconf = load_server_conf()
@@ -314,6 +569,7 @@ class Handler(BaseHTTPRequestHandler):
             ok, status = apply_singbox(parsed, base_port)
             if not ok:
                 return self._json({"ok": False, "error": status}, 500)
+            rebuild_scheduler(parsed)
             self._json({"ok": True, "status": status})
 
         elif path == "/api/server-config":
@@ -342,10 +598,10 @@ HTML_PAGE = """\
 :root{
   --bg:#0e1117;--surface:#161b22;--surface2:#1c2128;
   --border:#21262d;--accent:#58a6ff;--success:#3fb950;
-  --error:#f85149;--text:#c9d1d9;--muted:#8b949e;--r:6px;
+  --error:#f85149;--warn:#d29922;--text:#c9d1d9;--muted:#8b949e;--r:6px;
 }
 body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;min-height:100vh}
-.wrap{max-width:940px;margin:0 auto;padding:24px 16px}
+.wrap{max-width:980px;margin:0 auto;padding:24px 16px}
 .hdr{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap}
 .hdr-title{font-size:17px;font-weight:600;color:#fff;letter-spacing:-.3px}
 .hdr-title span{color:var(--muted);font-weight:400;font-size:13px;margin-left:4px}
@@ -355,7 +611,6 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 .dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0;transition:background .3s}
 .dot.on{background:var(--success);box-shadow:0 0 5px var(--success)}.dot.off{background:var(--error)}
 
-/* server config row */
 .sconf{display:flex;align-items:center;gap:8px;background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:9px 14px;margin-bottom:12px;flex-wrap:wrap}
 .sconf-label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
 .sconf input{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:13px;font-family:monospace;padding:4px 8px;outline:none;transition:border-color .15s;width:160px}
@@ -369,13 +624,16 @@ tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
 tbody tr:last-child{border-bottom:none}
 tbody tr:hover{background:rgba(255,255,255,.025)}
 td{padding:6px 10px;vertical-align:middle}
-.col-n{width:64px}.col-login{width:120px}.col-port{width:76px}.col-pass{min-width:160px}.col-test{width:160px}.col-act{width:84px;text-align:right}
+.col-n{width:56px}.col-login{width:110px}.col-port{width:70px}.col-pass{min-width:140px}
+.col-interval{width:90px}.col-test{width:140px}.col-act{width:140px;text-align:right}
 
 input[type=text],input[type=number]{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:13px;font-family:monospace;padding:5px 8px;width:100%;outline:none;transition:border-color .15s}
 input:focus{border-color:var(--accent)}
 input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
-.inp-n{width:56px;-moz-appearance:textfield}
+.inp-n{width:48px;-moz-appearance:textfield}
 .inp-n::-webkit-inner-spin-button,.inp-n::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.inp-interval{width:60px;-moz-appearance:textfield}
+.inp-interval::-webkit-inner-spin-button,.inp-interval::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 .pass-wrap{display:flex;gap:4px}.pass-wrap input{flex:1}
 .badge-h{font-size:10px;padding:1px 4px;border:1px solid var(--success);border-radius:3px;color:var(--success);margin-left:4px;vertical-align:middle;white-space:nowrap}
 
@@ -384,7 +642,10 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
 .btn:disabled{opacity:.45;cursor:not-allowed;pointer-events:none}
 .btn-primary{background:var(--accent);border-color:var(--accent);color:#000;font-weight:600}
 .btn-primary:hover{background:#79b8ff;border-color:#79b8ff;color:#000}
-.btn-icon{padding:5px 7px}.btn-del:hover{border-color:var(--error);color:var(--error)}.btn-sm{padding:4px 9px;font-size:12px}
+.btn-icon{padding:5px 7px}
+.btn-del:hover{border-color:var(--error);color:var(--error)}
+.btn-reboot:hover{border-color:var(--warn);color:var(--warn)}
+.btn-sm{padding:4px 9px;font-size:12px}
 
 .bar{display:flex;gap:8px;align-items:center;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:var(--r);flex-wrap:wrap}
 .bar-right{margin-left:auto;display:flex;gap:8px}
@@ -393,21 +654,22 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
 .tres.ok{color:var(--success)}.tres.fail{color:var(--error)}.tres.pend{color:var(--muted)}
 
 .toasts{position:fixed;top:18px;right:18px;z-index:999;display:flex;flex-direction:column;gap:6px}
-.toast{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:9px 15px;font-size:13px;max-width:300px;animation:tin .18s ease}
-.toast.ok{border-color:var(--success);color:var(--success)}.toast.err{border-color:var(--error);color:var(--error)}.toast.info{border-color:var(--accent);color:var(--accent)}
+.toast{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:9px 15px;font-size:13px;max-width:320px;animation:tin .18s ease}
+.toast.ok{border-color:var(--success);color:var(--success)}.toast.err{border-color:var(--error);color:var(--error)}.toast.info{border-color:var(--accent);color:var(--accent)}.toast.warn{border-color:var(--warn);color:var(--warn)}
 @keyframes tin{from{transform:translateX(16px);opacity:0}to{transform:translateX(0);opacity:1}}
 .spin{display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:rot .6s linear infinite}
 @keyframes rot{to{transform:rotate(360deg)}}
 .empty{text-align:center;padding:36px;color:var(--muted);font-size:13px}
 
-/* log modal */
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;align-items:center;justify-content:center}
 .modal-overlay.open{display:flex}
-.modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);width:min(860px,95vw);max-height:80vh;display:flex;flex-direction:column}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);width:min(900px,95vw);max-height:80vh;display:flex;flex-direction:column}
 .modal-hdr{display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border);gap:8px}
 .modal-hdr h3{font-size:14px;font-weight:600;flex:1;color:#fff}
 .log-body{flex:1;overflow-y:auto;padding:12px 16px;font-family:monospace;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:var(--text);background:var(--bg)}
-.log-body .err{color:var(--error)}.log-body .warn{color:var(--warn,#d29922)}.log-body .ok{color:var(--success)}
+.log-body .err{color:var(--error)}.log-body .warn{color:var(--warn)}.log-body .ok{color:var(--success)}
+
+.interval-hint{font-size:10px;color:var(--muted);display:block;margin-top:1px;text-align:center}
 </style>
 </head>
 <body>
@@ -440,16 +702,17 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
         <th class="col-login">Логин</th>
         <th class="col-port">Порт</th>
         <th class="col-pass">Пароль</th>
-        <th class="col-test">Тест</th>
+        <th class="col-interval" title="Интервал авто-реконнекта в минутах (0 = выкл)">Интервал<br><span style="font-size:9px;font-weight:400;letter-spacing:0">(мин, 0=выкл)</span></th>
+        <th class="col-test">Тест / IP</th>
         <th class="col-act"></th>
       </tr></thead>
-      <tbody id="tbody"><tr><td colspan="6" class="empty">Загрузка…</td></tr></tbody>
+      <tbody id="tbody"><tr><td colspan="7" class="empty">Загрузка…</td></tr></tbody>
     </table>
   </div>
 
   <div class="bar">
     <button class="btn" onclick="addRow()">+ Добавить</button>
-    <button class="btn" onclick="openLogs()" style="color:var(--muted)">≡ Логи</button>
+    <button class="btn" onclick="openLogs()" style="color:var(--muted)">≡ Логи SB</button>
     <div class="bar-right">
       <button class="btn" onclick="copyClient()">⎘&nbsp;Скопировать</button>
       <button class="btn btn-primary" id="applyBtn" onclick="doApply()">Применить</button>
@@ -457,7 +720,7 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
   </div>
 </div>
 
-<!-- log modal -->
+<!-- sing-box log modal -->
 <div class="modal-overlay" id="logModal" onclick="if(event.target===this)closeLogs()">
   <div class="modal">
     <div class="modal-hdr">
@@ -469,10 +732,23 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
   </div>
 </div>
 
+<!-- reconnect log modal -->
+<div class="modal-overlay" id="reconnModal" onclick="if(event.target===this)closeReconn()">
+  <div class="modal">
+    <div class="modal-hdr">
+      <h3 id="reconnModalTitle">Reconnect Log</h3>
+      <button class="btn btn-sm" onclick="refreshReconnLog()">⟳ Обновить</button>
+      <button class="btn btn-sm" onclick="closeReconn()">✕</button>
+    </div>
+    <div class="log-body" id="reconnLogBody">Загрузка…</div>
+  </div>
+</div>
+
 <div class="toasts" id="toasts"></div>
 
 <script>
 let localIp='', extIp='', basePort=10000, confDirty=false, hasTls=false;
+let _reconnLogN=0;
 
 window.onerror=function(msg,src,line){
   toast('JS: '+msg+' (line '+line+')','err',15000);return false;};
@@ -494,7 +770,7 @@ function markDirty(){
   document.getElementById('saveConfBtn').style.display='';
 }
 
-function makeRow(n='',pass=''){
+function makeRow(n='',pass='',interval=0){
   const tr=document.createElement('tr');if(n)tr.dataset.n=n;
   const p=pass||randPass();
   const port=n?calcPort(n):'—';
@@ -503,16 +779,20 @@ function makeRow(n='',pass=''){
     <td class="col-login"><input type="text" value="${n?'modem'+n:''}" readonly tabindex="-1"></td>
     <td class="col-port"><input type="text" value="${port}" readonly tabindex="-1" id="port-${n}"></td>
     <td class="col-pass"><div class="pass-wrap"><input type="text" value="${p}" autocomplete="off"><button class="btn btn-icon" onclick="repass(this)" title="Новый пароль">↺</button></div></td>
+    <td class="col-interval"><input class="inp-interval" type="number" min="0" max="9999" value="${interval||0}" title="Авто-реконнект каждые N минут (0 = выкл)"></td>
     <td class="col-test"><span class="tres" id="tr${n}"></span></td>
     <td class="col-act" style="display:flex;gap:3px;justify-content:flex-end;padding:6px 10px">
-      <button class="btn btn-sm" onclick="doTest(this)">▶ Test</button>
+      <button class="btn btn-sm" onclick="doTest(this)" title="Тест прокси + Huawei">▶ Test</button>
+      <button class="btn btn-icon" onclick="doReconnect(this)" title="Реконнект (смена IP)">⟲</button>
+      <button class="btn btn-icon btn-reboot" onclick="doReboot(this)" title="Ребут модема">↺</button>
+      <button class="btn btn-icon" onclick="showReconnLog(parseInt(this.closest('tr').dataset.n))" title="Лог реконнектов">☰</button>
       <button class="btn btn-icon btn-del" onclick="delRow(this)">✕</button>
     </td>`;
   return tr;
 }
 
 function onN(inp){
-  inp.value=inp.value.replace(/\\D/g,'').slice(0,3);   // только цифры, max 3
+  inp.value=inp.value.replace(/\\D/g,'').slice(0,3);
   const tr=inp.closest('tr');const n=inp.value;tr.dataset.n=n;
   tr.querySelector('.col-login input').value=n?`modem${n}`:'';
   const portInp=tr.querySelector('.col-port input');
@@ -531,19 +811,23 @@ function refreshPorts(){
 
 function repass(btn){btn.closest('.pass-wrap').querySelector('input').value=randPass();}
 
-function addRow(n='',pass=''){
+function addRow(n='',pass='',interval=0){
   const tb=document.getElementById('tbody');
   const em=tb.querySelector('.empty');if(em)em.closest('tr').remove();
-  tb.appendChild(makeRow(n,pass));
+  tb.appendChild(makeRow(n,pass,interval));
 }
 function delRow(btn){
   btn.closest('tr').remove();
   const tb=document.getElementById('tbody');
-  if(!tb.querySelector('tr'))tb.innerHTML='<tr><td colspan="6" class="empty">Нет модемов — нажми + Добавить</td></tr>';
+  if(!tb.querySelector('tr'))tb.innerHTML='<tr><td colspan="7" class="empty">Нет модемов — нажми + Добавить</td></tr>';
 }
 function getRows(){
   return[...document.querySelectorAll('#tbody tr[data-n]')]
-    .map(tr=>({n:parseInt(tr.dataset.n),password:tr.querySelector('.pass-wrap input').value.trim()}))
+    .map(tr=>({
+      n:parseInt(tr.dataset.n),
+      password:tr.querySelector('.pass-wrap input').value.trim(),
+      interval_min:parseInt(tr.querySelector('.inp-interval').value)||0
+    }))
     .filter(m=>m.n&&m.password);
 }
 
@@ -568,8 +852,8 @@ async function loadModems(){
   try{
     const ms=await fetch('/api/modems').then(r=>r.json());
     const tb=document.getElementById('tbody');tb.innerHTML='';
-    if(!ms.length){tb.innerHTML='<tr><td colspan="6" class="empty">Нет модемов — нажми + Добавить</td></tr>';return;}
-    ms.forEach(m=>tb.appendChild(makeRow(m.n,m.password)));
+    if(!ms.length){tb.innerHTML='<tr><td colspan="7" class="empty">Нет модемов — нажми + Добавить</td></tr>';return;}
+    ms.forEach(m=>tb.appendChild(makeRow(m.n,m.password,m.interval_min||0)));
   }catch(e){}
 }
 
@@ -606,7 +890,6 @@ async function saveConf(){
 async function doApply(){
   const rows=getRows();
   if(!rows.length){toast('Добавь хотя бы один модем','err');return;}
-  // auto-save conf if dirty
   if(confDirty) await saveConf();
   const btn=document.getElementById('applyBtn');
   btn.disabled=true;btn.innerHTML='<span class="spin"></span>&nbsp;Применяю…';
@@ -637,12 +920,61 @@ async function doTest(btn){
   btn.disabled=false;
 }
 
+async function doReconnect(btn){
+  const tr=btn.closest('tr');const n=parseInt(tr.dataset.n);
+  if(!n){toast('Укажи N','err');return;}
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span>';
+  toast(`modem${n}: реконнект…`,'info',20000);
+  try{
+    const d=await fetch(`/api/reconnect/${n}`).then(r=>r.json());
+    if(d.ok) toast(`modem${n}: ${d.msg} (${d.dt}s)`,'ok');
+    else     toast(`modem${n}: ${d.msg}`,'err',7000);
+  }catch(e){toast(`modem${n}: ошибка`,'err');}
+  btn.disabled=false;btn.innerHTML=orig;
+}
+
+async function doReboot(btn){
+  const tr=btn.closest('tr');const n=parseInt(tr.dataset.n);
+  if(!n){toast('Укажи N','err');return;}
+  if(!confirm(`Ребут modem${n}? Модем будет недоступен ~30–60 сек.`))return;
+  btn.disabled=true;const orig=btn.innerHTML;btn.innerHTML='<span class="spin"></span>';
+  try{
+    const d=await fetch(`/api/reboot/${n}`).then(r=>r.json());
+    if(d.ok) toast(`modem${n}: ${d.msg}`,'warn',6000);
+    else     toast(`modem${n}: ${d.msg}`,'err',7000);
+  }catch(e){toast(`modem${n}: ошибка`,'err');}
+  btn.disabled=false;btn.innerHTML=orig;
+}
+
+async function showReconnLog(n){
+  _reconnLogN=n;
+  document.getElementById('reconnModalTitle').textContent=`Reconnect Log — modem${n}`;
+  document.getElementById('reconnModal').classList.add('open');
+  await refreshReconnLog();
+}
+async function refreshReconnLog(){
+  const el=document.getElementById('reconnLogBody');
+  el.textContent='Загрузка…';
+  try{
+    const d=await fetch(`/api/reconnect-log/${_reconnLogN}`).then(r=>r.json());
+    if(!d.lines||!d.lines.length){el.textContent='(нет записей)';return;}
+    el.innerHTML=d.lines.map(l=>{
+      const safe=l.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+      if(l.includes('| ok |')||l.includes('reconnected')) return `<span class="ok">${safe}</span>`;
+      if(l.includes('| fail |')) return `<span class="err">${safe}</span>`;
+      if(l.includes('| reboot |')) return `<span class="warn">${safe}</span>`;
+      return safe;
+    }).join('\\n');
+    el.scrollTop=el.scrollHeight;
+  }catch(e){el.textContent='Ошибка загрузки';}
+}
+function closeReconn(){document.getElementById('reconnModal').classList.remove('open');}
+
 function copyClient(){
   const rows=getRows();
   if(!rows.length){toast('Нет модемов','err');return;}
   const ip=document.getElementById('extIp').value.trim()||localIp;
   const bp=parseInt(document.getElementById('basePort').value)||basePort;
-  // формат: IP:PORT:login:pass  (без N-префикса)
   const lines=rows.map(m=>`${ip}:${bp+m.n}:modem${m.n}:${m.password}`);
   const text=lines.join('\\n');
   navigator.clipboard.writeText(text)
@@ -668,7 +1000,6 @@ async function refreshLogs(){
 function openLogs(){document.getElementById('logModal').classList.add('open');refreshLogs();}
 function closeLogs(){document.getElementById('logModal').classList.remove('open');}
 
-// debug: confirm script reached end
 document.title='modlink ✓';
 try{loadInfo();loadModems();}catch(e){document.title='ERR:'+e.message;}
 setInterval(loadInfo,8000);
@@ -683,6 +1014,13 @@ def main() -> None:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--no-browser", action="store_true")
     a = p.parse_args()
+
+    # Restore scheduler from saved config
+    try:
+        rebuild_scheduler(load_modems())
+    except Exception as e:
+        print(f"[scheduler] startup: {e}")
+
     url = f"http://{a.host}:{a.port}"
     print(f"  modlink panel → {url}")
     if not a.no_browser:
