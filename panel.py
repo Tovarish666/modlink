@@ -124,18 +124,16 @@ def save_modems(modems: list[dict]) -> None:
     MODEMS_CONF.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 # ---------------------------------------------------------------------------
-# Port layout: 3 ports per modem (sorted index i):
-#   BASE + i*3 + 0  → HTTP proxy  (sing-box type=http)
-#   BASE + i*3 + 1  → SOCKS5      (sing-box type=socks)
-#   BASE + i*3 + 2  → Reconnect   (mini HTTP server /reconnect)
+# Port layout: 2 ports per modem (sorted index i):
+#   BASE + i*2 + 0  → mixed proxy  (sing-box type=mixed: HTTP CONNECT + SOCKS5)
+#   BASE + i*2 + 1  → Reconnect    (mini HTTP server /reconnect)
 # ---------------------------------------------------------------------------
 def calc_ports(modems: list[dict], base_port: int) -> dict[int, dict]:
     result = {}
     for i, m in enumerate(sorted(modems, key=lambda x: x["n"])):
         result[m["n"]] = {
-            "http_port":   base_port + i * 3,
-            "socks_port":  base_port + i * 3 + 1,
-            "reconn_port": base_port + i * 3 + 2,
+            "mixed_port":  base_port + i * 2,
+            "reconn_port": base_port + i * 2 + 1,
         }
     return result
 
@@ -335,9 +333,9 @@ def rebuild_scheduler(modems: list[dict]) -> None:
 
 # ---------------------------------------------------------------------------
 # sing-box config
-# Ports per modem (sorted index i): http=BASE+i*3, socks=BASE+i*3+1
-# Separate http+socks inbounds — fixes HTTPS CONNECT reliability vs mixed
-# DNS fix: udp:// prefix required in sing-box 1.12+
+# Ports per modem (sorted index i):
+#   mixed=BASE+i*2  — handles both HTTP CONNECT (HTTPS) and SOCKS5 on one port
+# No custom DNS section — sing-box uses system resolver (avoids version issues)
 # ---------------------------------------------------------------------------
 def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -> dict:
     inbounds, outbounds, rules = [], [], []
@@ -346,39 +344,28 @@ def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -
     for m in sorted(modems, key=lambda x: x["n"]):
         p = ports[m["n"]]
         n = m["n"]
-        http_in: dict = {
-            "type": "http",
-            "tag": f"in-http-{n}",
+        inbound: dict = {
+            "type": "http" if tls else "mixed",
+            "tag": f"in-{n}",
             "listen": "0.0.0.0",
-            "listen_port": p["http_port"],
+            "listen_port": p["mixed_port"],
             "users": [{"username": f"modem{n}", "password": m["password"]}],
         }
         if tls:
-            http_in["tls"] = {"enabled": True,
+            inbound["tls"] = {"enabled": True,
                               "certificate_path": str(CERT_FILE),
                               "key_path": str(KEY_FILE)}
-        inbounds.append(http_in)
-        inbounds.append({
-            "type": "socks",
-            "tag": f"in-socks-{n}",
-            "listen": "0.0.0.0",
-            "listen_port": p["socks_port"],
-            "users": [{"username": f"modem{n}", "password": m["password"]}],
-        })
+        inbounds.append(inbound)
         outbounds.append({
             "type": "direct",
             "tag": f"out-{n}",
             "inet4_bind_address": f"192.168.{n}.100",
         })
-        rules.append({"inbound": [f"in-http-{n}", f"in-socks-{n}"], "outbound": f"out-{n}"})
+        rules.append({"inbound": [f"in-{n}"], "outbound": f"out-{n}"})
 
     outbounds.append({"type": "direct", "tag": "direct"})
     return {
         "log": {"level": "warn", "timestamp": True},
-        "dns": {
-            "servers": [{"tag": "dns-cf", "address": "udp://1.1.1.1"}],
-            "final": "dns-cf",
-        },
         "inbounds": inbounds,
         "outbounds": outbounds,
         "route": {"rules": rules, "final": "direct"},
@@ -473,8 +460,7 @@ class Handler(BaseHTTPRequestHandler):
             for m in modems:
                 p = ports.get(m["n"], {})
                 result.append({**m,
-                    "http_port":   p.get("http_port"),
-                    "socks_port":  p.get("socks_port"),
+                    "mixed_port":  p.get("mixed_port"),
                     "reconn_port": p.get("reconn_port"),
                     "reconn_url":  f"http://{ext_ip}:{p['reconn_port']}/reconnect" if p else "",
                 })
@@ -500,9 +486,9 @@ class Handler(BaseHTTPRequestHandler):
             sconf = load_server_conf()
             base = sconf.get("base_port", DEFAULT_BASE_PORT)
             p = calc_ports(modems, base).get(n, {})
-            http_port = p.get("http_port", base + n)
+            mixed_port = p.get("mixed_port", base + n)
             scheme = "https" if has_tls() else "http"
-            proxy = f"{scheme}://modem{n}:{m['password']}@127.0.0.1:{http_port}"
+            proxy = f"{scheme}://modem{n}:{m['password']}@127.0.0.1:{mixed_port}"
             insecure = "--proxy-insecure" if has_tls() else ""
             curl_cmd = f'curl -s --max-time 8 --proxy "{proxy}" {insecure}'.strip()
             r1 = subprocess.run(f"{curl_cmd} http://ip.me",
@@ -683,7 +669,7 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
       <thead><tr>
         <th class="col-n">N</th>
         <th class="col-login">Логин</th>
-        <th class="col-ports">HTTP / SOCKS</th>
+        <th class="col-ports">Порт (mix)</th>
         <th class="col-reconn">Реконнект URL</th>
         <th class="col-pass">Пароль</th>
         <th class="col-interval">Интервал<br><span style="font-size:9px;font-weight:400">(мин,0=выкл)</span></th>
@@ -762,25 +748,24 @@ function refreshComputedPorts(){
   document.querySelectorAll('#tbody tr[data-n]').forEach(tr=>{
     const n=parseInt(tr.dataset.n);
     const idx=ns.indexOf(n);if(idx<0)return;
-    const p=getPortsForIndex(idx);
+    const bp=parseInt(document.getElementById('basePort').value)||10000;
+    const mp=bp+idx*2; const rp=bp+idx*2+1;
     const portsDiv=tr.querySelector('.ports-val');
-    if(portsDiv)portsDiv.innerHTML=`<span>HTTP&nbsp;${p.http}</span><span>SOCKS&nbsp;${p.socks}</span>`;
+    if(portsDiv)portsDiv.innerHTML=`<span>${mp}</span>`;
     const reconnInp=tr.querySelector('.inp-reconn');
-    if(reconnInp)reconnInp.value=`http://${ip}:${p.reconn}/reconnect`;
-    // store for copy
-    tr.dataset.httpPort=p.http;tr.dataset.socksPort=p.socks;tr.dataset.reconnPort=p.reconn;
+    if(reconnInp)reconnInp.value=`http://${ip}:${rp}/reconnect`;
+    tr.dataset.mixedPort=mp;tr.dataset.reconnPort=rp;
   });
 }
 
-function makeRow(n='',pass='',interval=0,httpPort='',socksPort='',reconnUrl=''){
+function makeRow(n='',pass='',interval=0,mixedPort='',reconnUrl=''){
   const tr=document.createElement('tr');if(n)tr.dataset.n=n;
   const p=pass||randPass();
-  if(httpPort)tr.dataset.httpPort=httpPort;
-  if(socksPort)tr.dataset.socksPort=socksPort;
+  if(mixedPort)tr.dataset.mixedPort=mixedPort;
   tr.innerHTML=`
     <td class="col-n"><input class="inp-n" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" value="${n}" placeholder="N" oninput="onN(this)"></td>
     <td class="col-login"><input type="text" value="${n?'modem'+n:''}" readonly tabindex="-1"></td>
-    <td class="col-ports"><div class="ports-wrap"><div class="ports-val">${httpPort?`<span>HTTP&nbsp;${httpPort}</span><span>SOCKS&nbsp;${socksPort}</span>`:'<span style="color:var(--muted)">—</span>'}</div></div></td>
+    <td class="col-ports"><div class="ports-wrap"><div class="ports-val">${mixedPort?`<span>${mixedPort}</span>`:'<span style="color:var(--muted)">—</span>'}</div></div></td>
     <td class="col-reconn"><div class="reconn-wrap"><input class="inp-reconn" type="text" value="${reconnUrl||''}" readonly tabindex="-1"><button class="btn btn-icon" onclick="copyReconn(this)" title="Копировать URL">⎘</button></div></td>
     <td class="col-pass"><div class="pass-wrap"><input type="text" value="${p}" autocomplete="off"><button class="btn btn-icon" onclick="repass(this)" title="Новый пароль">↺</button></div></td>
     <td class="col-interval"><input class="inp-interval" type="number" min="0" max="9999" value="${interval||0}" title="Авто-реконнект (мин, 0=выкл)"></td>
@@ -812,10 +797,10 @@ function copyReconn(btn){
       document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();toast('Скопирован','ok');});
 }
 
-function addRow(n='',pass='',interval=0,hp='',sp='',ru=''){
+function addRow(n='',pass='',interval=0,mp='',ru=''){
   const tb=document.getElementById('tbody');
   const em=tb.querySelector('.empty');if(em)em.closest('tr').remove();
-  tb.appendChild(makeRow(n,pass,interval,hp,sp,ru));
+  tb.appendChild(makeRow(n,pass,interval,mp,ru));
   refreshComputedPorts();
 }
 function delRow(btn){
@@ -829,8 +814,7 @@ function getRows(){
     .map(tr=>({n:parseInt(tr.dataset.n),
                password:tr.querySelector('.pass-wrap input').value.trim(),
                interval_min:parseInt(tr.querySelector('.inp-interval').value)||0,
-               _hp:parseInt(tr.dataset.httpPort||0),
-               _sp:parseInt(tr.dataset.socksPort||0),
+               _mp:parseInt(tr.dataset.mixedPort||0),
                _rp:parseInt(tr.dataset.reconnPort||0),
                _ru:tr.querySelector('.inp-reconn').value}))
     .filter(m=>m.n&&m.password);
@@ -859,7 +843,7 @@ async function loadModems(){
     const tb=document.getElementById('tbody');tb.innerHTML='';
     if(!ms.length){tb.innerHTML='<tr><td colspan="8" class="empty">Нет модемов — нажми + Добавить</td></tr>';return;}
     ms.forEach(m=>tb.appendChild(makeRow(m.n,m.password,m.interval_min||0,
-      m.http_port,m.socks_port,m.reconn_url)));
+      m.mixed_port,m.reconn_url)));
   }catch(e){}
 }
 
@@ -971,9 +955,9 @@ function copyClient(){
   if(!rows.length){toast('Нет модемов','err');return;}
   const ip=document.getElementById('extIp').value.trim()||localIp;
   const lines=rows.map(m=>{
-    const hp=m._hp||'?';const sp=m._sp||'?';
+    const mp=m._mp||'?';
     const ru=m._ru||'?';
-    return `${ip}:${hp}:modem${m.n}:${m.password}\\t${ip}:${sp}:modem${m.n}:${m.password}\\t${ru}`;
+    return `${ip}:${mp}:modem${m.n}:${m.password}\\t${ip}:${mp}:modem${m.n}:${m.password}\\t${ru}`;
   });
   const text=lines.join('\\n');
   navigator.clipboard.writeText(text)
