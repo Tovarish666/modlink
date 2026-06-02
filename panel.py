@@ -664,7 +664,9 @@ async function refreshLogs(){
 function openLogs(){document.getElementById('logModal').classList.add('open');refreshLogs();}
 function closeLogs(){document.getElementById('logModal').classList.remove('open');}
 
-loadInfo();loadModems();
+// debug: confirm script reached end
+document.title='modlink ✓';
+try{loadInfo();loadModems();}catch(e){document.title='ERR:'+e.message;}
 setInterval(loadInfo,8000);
 </script>
 </body>
