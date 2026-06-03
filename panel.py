@@ -371,8 +371,62 @@ def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -
         "route": {"rules": rules, "final": "direct"},
     }
 
+def _find_openssl() -> str | None:
+    found = shutil.which("openssl")
+    if found:
+        return found
+    if IS_WIN:
+        for candidate in [
+            r"C:\Program Files\Git\usr\bin\openssl.exe",
+            r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
+            r"C:\Program Files (x86)\OpenSSL-Win32\bin\openssl.exe",
+        ]:
+            if Path(candidate).exists():
+                return candidate
+    return None
+
+def _ensure_cert_ps() -> None:
+    ps = (
+        '$c=New-SelfSignedCertificate -DnsName modlink-server '
+        '-CertStoreLocation Cert:\\LocalMachine\\My '
+        '-NotAfter (Get-Date).AddYears(10) -KeyExportPolicy Exportable;'
+        '$cb=[Convert]::ToBase64String($c.RawData,"InsertLineBreaks");'
+        'echo "-----BEGIN CERTIFICATE-----";echo $cb;echo "-----END CERTIFICATE-----";'
+        '$rsa=[System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($c);'
+        '$kb=[Convert]::ToBase64String($rsa.ExportPkcs8PrivateKey(),"InsertLineBreaks");'
+        'echo "-----BEGIN PRIVATE KEY-----";echo $kb;echo "-----END PRIVATE KEY-----"'
+    )
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       capture_output=True, text=True)
+    o = r.stdout
+    c0 = o.find("-----BEGIN CERTIFICATE-----")
+    c1 = o.find("-----END CERTIFICATE-----") + len("-----END CERTIFICATE-----")
+    k0 = o.find("-----BEGIN PRIVATE KEY-----")
+    k1 = o.find("-----END PRIVATE KEY-----") + len("-----END PRIVATE KEY-----")
+    if c0 < 0 or k0 < 0:
+        raise RuntimeError(f"PowerShell cert gen failed:\n{r.stderr}")
+    CERT_FILE.write_text(o[c0:c1], encoding="ascii")
+    KEY_FILE.write_text(o[k0:k1], encoding="ascii")
+
+def ensure_cert() -> None:
+    CERT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if CERT_FILE.exists() and KEY_FILE.exists():
+        return
+    openssl = _find_openssl()
+    if openssl:
+        subprocess.run(
+            [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", str(KEY_FILE), "-out", str(CERT_FILE),
+             "-days", "3650", "-subj", "/CN=modlink-server"],
+            capture_output=True, check=True
+        )
+        return
+    if IS_WIN:
+        _ensure_cert_ps()
+
 def apply_singbox(modems: list[dict], base_port: int) -> tuple[bool, str]:
     CONF_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_cert()
     SB_CONF.write_text(json.dumps(gen_singbox_config(modems, base_port), indent=2), encoding="utf-8")
     if not IS_WIN:
         SB_CONF.chmod(0o600)
