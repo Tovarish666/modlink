@@ -33,7 +33,8 @@ KEY_FILE     = CONF_DIR / "certs" / "key.pem"
 LOG_DIR      = CONF_DIR / "logs"
 
 def has_tls() -> bool:
-    return CERT_FILE.exists() and KEY_FILE.exists()
+    return (CERT_FILE.exists() and CERT_FILE.stat().st_size > 64 and
+            KEY_FILE.exists()  and KEY_FILE.stat().st_size  > 64)
 
 def read_log(tail: int = 80) -> list[str]:
     if not SB_LOG.exists():
@@ -371,6 +372,57 @@ def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -
         "route": {"rules": rules, "final": "direct"},
     }
 
+_BUNDLED_CERT = """\
+-----BEGIN CERTIFICATE-----
+MIIDEzCCAfugAwIBAgIUekx/rYOXzGAhasTUefpS7TbHtI0wDQYJKoZIhvcNAQEL
+BQAwGTEXMBUGA1UEAwwObW9kbGluay1zZXJ2ZXIwHhcNMjYwNjAzMjIzMTE1WhcN
+MzYwNTMxMjIzMTE1WjAZMRcwFQYDVQQDDA5tb2RsaW5rLXNlcnZlcjCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBALF9cN90IwH8/+bujseBCYuNq31zcbwY
+E9YE8AiL0+BfGOXJoojor1fpv5W6Tj6+lYYs79soBzT+CUpN44iyz9E2Gup8vqD4
+dZpS9luWpaDbYUOJTaQrNXoYb8l+w8lkPtxPFoWJc/5BgCHOYUsqT4C3TnfBpa7z
+zjiPrGCfp8MIhxtKWP8USIQoKeVkgHtbQSJsera8Ll7qrwbO8Gjl19/cMGqyk494
+leT+IDowRbW8pnrcB0YzOhharHqMajFnNCJOYz+z4L8AF4c5QN41fq8zaYTNPouq
+n4LX6pEPWAPCFvnHdyNrQreWUJZWUX9QMOjNXxCmjGhAQ9DmPeoAWc0CAwEAAaNT
+MFEwHQYDVR0OBBYEFCo8pBnBisR/vq0RK7GXEC67byIMMB8GA1UdIwQYMBaAFCo8
+pBnBisR/vq0RK7GXEC67byIMMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL
+BQADggEBAA+7csEzoJJHTdguqEDjCEYPGXfyC7KmHf7aKLIJJ2MriRkUXGqKPljx
+rRQHUN0fEE2dOzmxUAEvUBOIViDMfcBDl6VWG0Go04xbNrqIvNz/armW0Isj6TgN
+11e6VdVFJM88yArIoiiSARTvrdTqI2SgQUT91kPrj6akANhMDXAJo6Hd2gay2uAl
+gzUrie/I9KuWxuqsJbBQ9O8HLOELy3CEgRS5rUkw8RU6E6sK3JLZ0/mI2khtU+e9
+2LqKzxVu4FhlKZt+AThLX8NTjTAroGAmx9sT4SYpJUNplfGvzO8UsFxtoWWCVxMR
+3BszaCihRPAo+fGOe4LkZen65J8gXx8=
+-----END CERTIFICATE-----"""
+
+_BUNDLED_KEY = """\
+-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCxfXDfdCMB/P/m
+7o7HgQmLjat9c3G8GBPWBPAIi9PgXxjlyaKI6K9X6b+Vuk4+vpWGLO/bKAc0/glK
+TeOIss/RNhrqfL6g+HWaUvZblqWg22FDiU2kKzV6GG/JfsPJZD7cTxaFiXP+QYAh
+zmFLKk+At053waWu8844j6xgn6fDCIcbSlj/FEiEKCnlZIB7W0EibHq2vC5e6q8G
+zvBo5dff3DBqspOPeJXk/iA6MEW1vKZ63AdGMzoYWqx6jGoxZzQiTmM/s+C/ABeH
+OUDeNX6vM2mEzT6Lqp+C1+qRD1gDwhb5x3cja0K3llCWVlF/UDDozV8QpoxoQEPQ
+5j3qAFnNAgMBAAECggEAJhB374QxqdB/dSA+QKz8xhAI8iua/bLQNjry23JZayoZ
+5dX7ZI86Y4k+zDabZztqR89FVWPdP9EnXucbYAqxJPYMibNdEpqWZhVavkOtm7TQ
+xDIjE40st9Wby8PC62LzVD4l31eeJ64Wc6mWFg+p4znsuyQtizrAREMTvdkfmmTS
+7jEWEKakI4tSSDHZ5PJKJgWhBXJguAk0LRg1sxVuR8J8yztWsuRj5+x5JDLOSuA/
+AviTT1RPoyQ4DravEBUWnwWMJMKj8TsDW/2wfkGjUcXsefGmCJ/Em5JNcy9WjjY4
+LhZpOQt5jfetG0MBOiRP5BmNqOxnG1SZ8YrO1/WooQKBgQDrHzswu2UPQRgr4bqr
+p0bJmQXnPWCVHN1tdarn1ff5oHT2fuyvnbec56aUP8iJe0hVS2OFhXxlvYRhVfjB
+q8n/cEaS/P63WAB5fi1nr5yJyFpl6+Semc4IIpP7Enk4NhFYEwypRdSgaqXx1Ayp
+Iuz49UYASlBGEdW8ujpgzeIBeQKBgQDBQCAOKxUeFUOBSuWEfU3ppIs44B1k8H18
+5ztn8BxFbWqaoASVtdiG9piIofn3wgyI711KLuFcNLxVsKqmDI9eVLwKI7q0SaNa
+FAdN4ZFCgTn7T/DEVOn0zvkAiLeknHGEaPfoMehCSSDDifxZDcP0D0LHsqV4KHw+
+vUM3Yik59QKBgQCm1ORE8dMFfeTOzj6MKgdaaI/9wllTtMWRM5rvIa3wnGAhv3Hm
+MnzkgqJ6Mr/yfV2X2ARn642XC2BxSHVXxrNv4pTRG18JbRH5IwTIu5zRTy6Ff1ob
+B3tf3lkuH6+PqR2pZurm+TukD8hrzVCmere29yKSdih7b5A/d8yQf8XL0QKBgBCZ
+76cH8HJ7JSdwRbNSCGVv6z3hkuTe/AjE3IebSvJz6dqKsJoj2wwNFyF1uMGd+/Gv
+jnYW/Oks5pj96ksFfTN/WAAO/bULNmtAmTgJjq8F5vM99NMI8GhFd4KiPBR6FA5p
+7hIWZ3t6SMRDkFgeJJ1MylHZePmPkMza+XFCj4QZAoGAPJG4ov39NW1LB6ciRBGd
+iXcUpxfLnT5xA2/CpxTTLn4R+iWnPR6lu8rHEb60m0AiDInhyhBNrUkMYTBFTs4y
+n9nAmMJBA6YI+BT7eEXD1HdWVj2WseaHqUwoBvbcpMe5TAq4cuxcy9Zs86llqmoJ
+2nwt+LfJWSFSvEtN+8WWQDM=
+-----END PRIVATE KEY-----"""
+
 def _find_openssl() -> str | None:
     found = shutil.which("openssl")
     if found:
@@ -419,19 +471,28 @@ def _ensure_cert_ps() -> None:
 
 def ensure_cert() -> None:
     CERT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if CERT_FILE.exists() and KEY_FILE.exists():
+    if has_tls():
         return
     openssl = _find_openssl()
     if openssl:
-        subprocess.run(
+        r = subprocess.run(
             [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
              "-keyout", str(KEY_FILE), "-out", str(CERT_FILE),
              "-days", "3650", "-subj", "/CN=modlink-server"],
-            capture_output=True, check=True
+            capture_output=True
         )
-        return
+        if r.returncode == 0 and has_tls():
+            return
     if IS_WIN:
-        _ensure_cert_ps()
+        try:
+            _ensure_cert_ps()
+            if has_tls():
+                return
+        except Exception:
+            pass
+    # fallback: write bundled self-signed cert
+    CERT_FILE.write_text(_BUNDLED_CERT, encoding="ascii")
+    KEY_FILE.write_text(_BUNDLED_KEY, encoding="ascii")
 
 def apply_singbox(modems: list[dict], base_port: int) -> tuple[bool, str]:
     CONF_DIR.mkdir(parents=True, exist_ok=True)
