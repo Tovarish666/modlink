@@ -376,10 +376,19 @@ def _find_openssl() -> str | None:
     if found:
         return found
     if IS_WIN:
+        try:
+            r = subprocess.run(["where.exe", "openssl"], capture_output=True, text=True)
+            if r.returncode == 0:
+                first = r.stdout.strip().splitlines()[0]
+                if first:
+                    return first
+        except Exception:
+            pass
         for candidate in [
             r"C:\Program Files\Git\usr\bin\openssl.exe",
             r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
             r"C:\Program Files (x86)\OpenSSL-Win32\bin\openssl.exe",
+            r"C:\Program Files\OpenSSL\bin\openssl.exe",
         ]:
             if Path(candidate).exists():
                 return candidate
