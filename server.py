@@ -94,21 +94,29 @@ def load_modems() -> list[Modem]:
 # ---------------------------------------------------------------------------
 def gen_singbox_config(modems: list[Modem]) -> dict:
     """
-    Порт-per-модем: mixed inbound (HTTP CONNECT + SOCKS5) на BASE_PORT + N.
+    Порт-per-модем: HTTP inbound с TLS на BASE_PORT + N.
     Маршрутизация по inbound тегу — изоляция отказов, удобный мониторинг.
     """
+    tls = CERT_FILE.exists() and KEY_FILE.exists()
     inbounds, outbounds, rules = [], [], []
     for m in modems:
         port    = BASE_PORT + m.n
         tag_in  = f"in-{m.n}"
         tag_out = f"out-{m.n}"
-        inbounds.append({
-            "type": "mixed",
+        inbound: dict = {
+            "type": "http" if tls else "mixed",
             "tag": tag_in,
             "listen": "0.0.0.0",
             "listen_port": port,
             "users": [{"username": m.username, "password": m.password}],
-        })
+        }
+        if tls:
+            inbound["tls"] = {
+                "enabled": True,
+                "certificate_path": str(CERT_FILE),
+                "key_path": str(KEY_FILE),
+            }
+        inbounds.append(inbound)
         outbounds.append({
             "type": "direct",
             "tag": tag_out,
@@ -220,8 +228,11 @@ def cmd_test(n: int, server_addr: str = "127.0.0.1") -> None:
     m = m_list[0]
 
     port      = BASE_PORT + m.n
-    proxy_url = f"http://{m.username}:{m.password}@{server_addr}:{port}"
-    curl_base = f"curl -s --max-time 10 --proxy '{proxy_url}'"
+    tls       = CERT_FILE.exists() and KEY_FILE.exists()
+    scheme    = "https" if tls else "http"
+    proxy_url = f"{scheme}://{m.username}:{m.password}@{server_addr}:{port}"
+    insecure  = "--proxy-insecure" if tls else ""
+    curl_base = f"curl -s --max-time 10 {insecure} --proxy '{proxy_url}'"
 
     print(f"  модем {m.n}  bind={m.bind_ip}  порт={port}")
     print(f"  прокси: {server_addr}:{port}  user={m.username}")
