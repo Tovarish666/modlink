@@ -194,10 +194,10 @@ def _gen_cert_ps() -> bool:
     )
     r = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-        capture_output=True, text=True, encoding="utf-8"
+        capture_output=True  # bytes — избегаем проблем с кодировкой русской Windows
     )
-    # PowerShell даёт CRLF — нормализуем перед записью
-    o = r.stdout.replace("\r\n", "\n").replace("\r", "\n")
+    # декодируем с заменой: PEM-данные чистый ASCII, остальное неважно
+    o = r.stdout.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     c0 = o.find("-----BEGIN CERTIFICATE-----")
     c1 = o.find("-----END CERTIFICATE-----")
     k0 = o.find("-----BEGIN PRIVATE KEY-----")
