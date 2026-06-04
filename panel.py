@@ -176,7 +176,8 @@ def _gen_cert_openssl(openssl: str) -> bool:
     return r.returncode == 0 and has_tls()
 
 def _gen_cert_ps() -> bool:
-    """Генерация сертификата через PowerShell PKI (Windows, без openssl)."""
+    """Генерация сертификата через PowerShell PKI (Windows, без openssl).
+    ExportPkcs8PrivateKey обёрнут в try/catch — диагностика без краша."""
     ps = (
         '$c=New-SelfSignedCertificate -DnsName modlink-server '
         '-CertStoreLocation Cert:\\LocalMachine\\My '
@@ -185,12 +186,14 @@ def _gen_cert_ps() -> bool:
         'Write-Output "-----BEGIN CERTIFICATE-----";'
         'Write-Output $cb;'
         'Write-Output "-----END CERTIFICATE-----";'
+        'try{'
         '$rsa=[System.Security.Cryptography.X509Certificates.RSACertificateExtensions]'
         '::GetRSAPrivateKey($c);'
         '$kb=[Convert]::ToBase64String($rsa.ExportPkcs8PrivateKey(),"InsertLineBreaks");'
         'Write-Output "-----BEGIN PRIVATE KEY-----";'
         'Write-Output $kb;'
         'Write-Output "-----END PRIVATE KEY-----"'
+        '}catch{Write-Output "PS_KEY_ERROR: $_"}'
     )
     r = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
@@ -198,6 +201,12 @@ def _gen_cert_ps() -> bool:
     )
     # декодируем с заменой: PEM-данные чистый ASCII, остальное неважно
     o = r.stdout.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    if r.stderr:
+        err = r.stderr.decode("utf-8", errors="replace").strip()
+        if err: print(f"  [cert] PS stderr: {err[:300]}")
+    if "PS_KEY_ERROR:" in o:
+        line = o[o.find("PS_KEY_ERROR:"):].split("\n")[0]
+        print(f"  [cert] {line.strip()}")
     c0 = o.find("-----BEGIN CERTIFICATE-----")
     c1 = o.find("-----END CERTIFICATE-----")
     k0 = o.find("-----BEGIN PRIVATE KEY-----")
@@ -210,9 +219,61 @@ def _gen_cert_ps() -> bool:
     KEY_FILE.write_text(o[k0:k1].strip() + "\n", encoding="ascii")
     return has_tls()
 
+_BUNDLED_CERT = """\
+-----BEGIN CERTIFICATE-----
+MIIDEzCCAfugAwIBAgIUekx/rYOXzGAhasTUefpS7TbHtI0wDQYJKoZIhvcNAQEL
+BQAwGTEXMBUGA1UEAwwObW9kbGluay1zZXJ2ZXIwHhcNMjYwNjAzMjIzMTE1WhcN
+MzYwNTMxMjIzMTE1WjAZMRcwFQYDVQQDDA5tb2RsaW5rLXNlcnZlcjCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBALF9cN90IwH8/+bujseBCYuNq31zcbwY
+E9YE8AiL0+BfGOXJoojor1fpv5W6Tj6+lYYs79soBzT+CUpN44iyz9E2Gup8vqD4
+dZpS9luWpaDbYUOJTaQrNXoYb8l+w8lkPtxPFoWJc/5BgCHOYUsqT4C3TnfBpa7z
+zjiPrGCfp8MIhxtKWP8USIQoKeVkgHtbQSJsera8Ll7qrwbO8Gjl19/cMGqyk494
+leT+IDowRbW8pnrcB0YzOhharHqMajFnNCJOYz+z4L8AF4c5QN41fq8zaYTNPouq
+n4LX6pEPWAPCFvnHdyNrQreWUJZWUX9QMOjNXxCmjGhAQ9DmPeoAWc0CAwEAAaNT
+MFEwHQYDVR0OBBYEFCo8pBnBisR/vq0RK7GXEC67byIMMB8GA1UdIwQYMBaAFCo8
+pBnBisR/vq0RK7GXEC67byIMMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL
+BQADggEBAA+7csEzoJJHTdguqEDjCEYPGXfyC7KmHf7aKLIJJ2MriRkUXGqKPljx
+rRQHUN0fEE2dOzmxUAEvUBOIViDMfcBDl6VWG0Go04xbNrqIvNz/armW0Isj6TgN
+11e6VdVFJM88yArIoiiSARTvrdTqI2SgQUT91kPrj6akANhMDXAJo6Hd2gay2uAl
+gzUrie/I9KuWxuqsJbBQ9O8HLOELy3CEgRS5rUkw8RU6E6sK3JLZ0/mI2khtU+e9
+2LqKzxVu4FhlKZt+AThLX8NTjTAroGAmx9sT4SYpJUNplfGvzO8UsFxtoWWCVxMR
+3BszaCihRPAo+fGOe4LkZen65J8gXx8=
+-----END CERTIFICATE-----"""
+
+_BUNDLED_KEY = """\
+-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCxfXDfdCMB/P/m
+7o7HgQmLjat9c3G8GBPWBPAIi9PgXxjlyaKI6K9X6b+Vuk4+vpWGLO/bKAc0/glK
+TeOIss/RNhrqfL6g+HWaUvZblqWg22FDiU2kKzV6GG/JfsPJZD7cTxaFiXP+QYAh
+zmFLKk+At053waWu8844j6xgn6fDCIcbSlj/FEiEKCnlZIB7W0EibHq2vC5e6q8G
+zvBo5dff3DBqspOPeJXk/iA6MEW1vKZ63AdGMzoYWqx6jGoxZzQiTmM/s+C/ABeH
+OUDeNX6vM2mEzT6Lqp+C1+qRD1gDwhb5x3cja0K3llCWVlF/UDDozV8QpoxoQEPQ
+5j3qAFnNAgMBAAECggEAJhB374QxqdB/dSA+QKz8xhAI8iua/bLQNjry23JZayoZ
+5dX7ZI86Y4k+zDabZztqR89FVWPdP9EnXucbYAqxJPYMibNdEpqWZhVavkOtm7TQ
+xDIjE40st9Wby8PC62LzVD4l31eeJ64Wc6mWFg+p4znsuyQtizrAREMTvdkfmmTS
+7jEWEKakI4tSSDHZ5PJKJgWhBXJguAk0LRg1sxVuR8J8yztWsuRj5+x5JDLOSuA/
+AviTT1RPoyQ4DravEBUWnwWMJMKj8TsDW/2wfkGjUcXsefGmCJ/Em5JNcy9WjjY4
+LhZpOQt5jfetG0MBOiRP5BmNqOxnG1SZ8YrO1/WooQKBgQDrHzswu2UPQRgr4bqr
+p0bJmQXnPWCVHN1tdarn1ff5oHT2fuyvnbec56aUP8iJe0hVS2OFhXxlvYRhVfjB
+q8n/cEaS/P63WAB5fi1nr5yJyFpl6+Semc4IIpP7Enk4NhFYEwypRdSgaqXx1Ayp
+Iuz49UYASlBGEdW8ujpgzeIBeQKBgQDBQCAOKxUeFUOBSuWEfU3ppIs44B1k8H18
+5ztn8BxFbWqaoASVtdiG9piIofn3wgyI711KLuFcNLxVsKqmDI9eVLwKI7q0SaNa
+FAdN4ZFCgTn7T/DEVOn0zvkAiLeknHGEaPfoMehCSSDDifxZDcP0D0LHsqV4KHw+
+vUM3Yik59QKBgQCm1ORE8dMFfeTOzj6MKgdaaI/9wllTtMWRM5rvIa3wnGAhv3Hm
+MnzkgqJ6Mr/yfV2X2ARn642XC2BxSHVXxrNv4pTRG18JbRH5IwTIu5zRTy6Ff1ob
+B3tf3lkuH6+PqR2pZurm+TukD8hrzVCmere29yKSdih7b5A/d8yQf8XL0QKBgBCZ
+76cH8HJ7JSdwRbNSCGVv6z3hkuTe/AjE3IebSvJz6dqKsJoj2wwNFyF1uMGd+/Gv
+jnYW/Oks5pj96ksFfTN/WAAO/bULNmtAmTgJjq8F5vM99NMI8GhFd4KiPBR6FA5p
+7hIWZ3t6SMRDkFgeJJ1MylHZePmPkMza+XFCj4QZAoGAPJG4ov39NW1LB6ciRBGd
+iXcUpxfLnT5xA2/CpxTTLn4R+iWnPR6lu8rHEb60m0AiDInhyhBNrUkMYTBFTs4y
+n9nAmMJBA6YI+BT7eEXD1HdWVj2WseaHqUwoBvbcpMe5TAq4cuxcy9Zs86llqmoJ
+2nwt+LfJWSFSvEtN+8WWQDM=
+-----END PRIVATE KEY-----"""
+
+
 def ensure_cert() -> None:
     """Гарантирует наличие TLS-сертификата. Вызывается при старте и перед Apply.
-    Порядок попыток: openssl → PowerShell PKI (Windows) → ошибка.
+    Порядок попыток: openssl → PowerShell PKI (Windows) → bundled fallback.
     """
     CERT_FILE.parent.mkdir(parents=True, exist_ok=True)
     if has_tls():
@@ -231,13 +292,14 @@ def ensure_cert() -> None:
         if _gen_cert_ps():
             print(f"  [cert] OK (PowerShell PKI) → {CERT_FILE}")
             return
-        print("  [cert] PowerShell PKI не сработал")
+        print("  [cert] PowerShell PKI не сработал, использую встроенный сертификат")
 
-    sys.exit(
-        "\n  [ОШИБКА] Не удалось сгенерировать TLS сертификат.\n"
-        "  Установи openssl (Linux: apt install openssl  |  Win: Git for Windows)\n"
-        "  и перезапусти панель.\n"
-    )
+    # Fallback: встроенный сертификат. Ключ одинаков для всех установок —
+    # достаточно для шифрования канала, но не для продакшна.
+    # Для уникального cert: установи openssl и удали certs/cert.pem + certs/key.pem
+    print("  [cert] FALLBACK: встроенный сертификат (общий ключ, только для теста)")
+    CERT_FILE.write_text(_BUNDLED_CERT, encoding="ascii")
+    KEY_FILE.write_text(_BUNDLED_KEY, encoding="ascii")
 
 
 # ---------------------------------------------------------------------------
