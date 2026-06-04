@@ -177,7 +177,9 @@ def _gen_cert_openssl(openssl: str) -> bool:
 
 def _gen_cert_ps() -> bool:
     """Генерация сертификата через PowerShell PKI (Windows, без openssl).
-    ExportPkcs8PrivateKey обёрнут в try/catch — диагностика без краша."""
+    ExportPkcs8PrivateKey доступен с .NET 4.7.2 / Windows 10 1803+.
+    При неудаче честно возвращает False → ensure_cert() использует bundled cert.
+    """
     ps = (
         '$c=New-SelfSignedCertificate -DnsName modlink-server '
         '-CertStoreLocation Cert:\\LocalMachine\\My '
@@ -197,13 +199,9 @@ def _gen_cert_ps() -> bool:
     )
     r = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-        capture_output=True  # bytes — избегаем проблем с кодировкой русской Windows
+        capture_output=True
     )
-    # декодируем с заменой: PEM-данные чистый ASCII, остальное неважно
     o = r.stdout.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
-    if r.stderr:
-        err = r.stderr.decode("utf-8", errors="replace").strip()
-        if err: print(f"  [cert] PS stderr: {err[:300]}")
     if "PS_KEY_ERROR:" in o:
         line = o[o.find("PS_KEY_ERROR:"):].split("\n")[0]
         print(f"  [cert] {line.strip()}")
@@ -1141,7 +1139,7 @@ async function refreshReconnLog(){
       if(l.includes('| fail |'))return`<span class="err">${s}</span>`;
       if(l.includes('| reboot |'))return`<span class="warn">${s}</span>`;
       return s;
-    }).join('\n');
+    }).join('\\n');
     el.scrollTop=el.scrollHeight;
   }catch(e){el.textContent='Ошибка';}
 }
@@ -1154,9 +1152,9 @@ function copyClient(){
   const lines=rows.map(m=>{
     const mp=m._mp||'?';
     const ru=m._ru||'?';
-    return `${ip}:${mp}:modem${m.n}:${m.password}\t${ru}`;
+    return `${ip}:${mp}:modem${m.n}:${m.password}\\t${ru}`;
   });
-  const text=lines.join('\n');
+  const text=lines.join('\\n');
   navigator.clipboard.writeText(text)
     .then(()=>toast(`Скопировано ${lines.length} строк`,'ok'))
     .catch(()=>{const ta=document.createElement('textarea');ta.value=text;
@@ -1173,7 +1171,7 @@ async function refreshLogs(){
       const cls=l.match(/FATAL|ERROR/i)?'err':l.match(/WARN/i)?'warn':l.match(/started|active/i)?'ok':'';
       const s=l.replace(/&/g,'&amp;').replace(/</g,'&lt;');
       return cls?`<span class="${cls}">${s}</span>`:s;
-    }).join('\n');
+    }).join('\\n');
     el.scrollTop=el.scrollHeight;
   }catch(e){el.textContent='Ошибка';}
 }
