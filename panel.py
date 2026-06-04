@@ -24,14 +24,21 @@ else:
     CONF_DIR    = Path("/etc/modlink")
     SINGBOX_BIN = Path(shutil.which("sing-box") or "/usr/local/bin/sing-box")
 
-MODEMS_CONF  = CONF_DIR / "modems.conf"
-SB_CONF      = CONF_DIR / "singbox.json"
-SERVER_CONF  = CONF_DIR / "server.json"
-SB_LOG       = CONF_DIR / "singbox.log"
-CERT_FILE    = CONF_DIR / "certs" / "cert.pem"
-KEY_FILE     = CONF_DIR / "certs" / "key.pem"
-LOG_DIR      = CONF_DIR / "logs"
+MODEMS_CONF = CONF_DIR / "modems.conf"
+SB_CONF     = CONF_DIR / "singbox.json"
+SERVER_CONF = CONF_DIR / "server.json"
+SB_LOG      = CONF_DIR / "singbox.log"
+CERT_FILE   = CONF_DIR / "certs" / "cert.pem"
+KEY_FILE    = CONF_DIR / "certs" / "key.pem"
+LOG_DIR     = CONF_DIR / "logs"
 
+DEFAULT_BASE_PORT = 10000
+_sb_proc: subprocess.Popen | None = None
+
+
+# ---------------------------------------------------------------------------
+# Утилиты
+# ---------------------------------------------------------------------------
 def has_tls() -> bool:
     return (CERT_FILE.exists() and CERT_FILE.stat().st_size > 64 and
             KEY_FILE.exists()  and KEY_FILE.stat().st_size  > 64)
@@ -41,9 +48,6 @@ def read_log(tail: int = 80) -> list[str]:
         return []
     lines = SB_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
     return lines[-tail:]
-
-DEFAULT_BASE_PORT = 10000
-_sb_proc: subprocess.Popen | None = None
 
 def rand_pass(length: int = 10) -> str:
     chars = "abcdefghjkmnpqrstuvwxyz23456789"
@@ -92,6 +96,25 @@ def get_sb_status() -> str:
     r = subprocess.run("systemctl is-active modlink", shell=True, capture_output=True, text=True)
     return r.stdout.strip() or "unknown"
 
+
+# ---------------------------------------------------------------------------
+# Порты: 2 порта на модем (sorted index i)
+#   BASE + i*2     → http proxy (sing-box, TLS)
+#   BASE + i*2 + 1 → ReconnectServer
+# ---------------------------------------------------------------------------
+def calc_ports(modems: list[dict], base_port: int) -> dict[int, dict]:
+    result = {}
+    for i, m in enumerate(sorted(modems, key=lambda x: x["n"])):
+        result[m["n"]] = {
+            "mixed_port":  base_port + i * 2,
+            "reconn_port": base_port + i * 2 + 1,
+        }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# modems.conf
+# ---------------------------------------------------------------------------
 def load_modems() -> list[dict]:
     if not MODEMS_CONF.exists():
         return []
@@ -124,22 +147,194 @@ def save_modems(modems: list[dict]) -> None:
         lines.append(line)
     MODEMS_CONF.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-# ---------------------------------------------------------------------------
-# Port layout: 2 ports per modem (sorted index i):
-#   BASE + i*2 + 0  → mixed proxy  (sing-box type=mixed: HTTP CONNECT + SOCKS5)
-#   BASE + i*2 + 1  → Reconnect    (mini HTTP server /reconnect)
-# ---------------------------------------------------------------------------
-def calc_ports(modems: list[dict], base_port: int) -> dict[int, dict]:
-    result = {}
-    for i, m in enumerate(sorted(modems, key=lambda x: x["n"])):
-        result[m["n"]] = {
-            "mixed_port":  base_port + i * 2,
-            "reconn_port": base_port + i * 2 + 1,
-        }
-    return result
 
 # ---------------------------------------------------------------------------
-# Huawei HiLink API (stdlib urllib, no pip)
+# TLS — генерация сертификата
+# ---------------------------------------------------------------------------
+def _find_openssl() -> str | None:
+    found = shutil.which("openssl")
+    if found:
+        return found
+    if IS_WIN:
+        for candidate in [
+            r"C:\Program Files\Git\usr\bin\openssl.exe",
+            r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
+            r"C:\Program Files (x86)\OpenSSL-Win32\bin\openssl.exe",
+            r"C:\Program Files\OpenSSL\bin\openssl.exe",
+        ]:
+            if Path(candidate).exists():
+                return candidate
+    return None
+
+def _gen_cert_openssl(openssl: str) -> bool:
+    r = subprocess.run(
+        [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", str(KEY_FILE), "-out", str(CERT_FILE),
+         "-days", "3650", "-subj", "/CN=modlink-server"],
+        capture_output=True
+    )
+    return r.returncode == 0 and has_tls()
+
+def _gen_cert_ps() -> bool:
+    """Генерация сертификата через PowerShell PKI (Windows, без openssl)."""
+    ps = (
+        '$c=New-SelfSignedCertificate -DnsName modlink-server '
+        '-CertStoreLocation Cert:\\LocalMachine\\My '
+        '-NotAfter (Get-Date).AddYears(10) -KeyExportPolicy Exportable;'
+        '$cb=[Convert]::ToBase64String($c.RawData,"InsertLineBreaks");'
+        'Write-Output "-----BEGIN CERTIFICATE-----";'
+        'Write-Output $cb;'
+        'Write-Output "-----END CERTIFICATE-----";'
+        '$rsa=[System.Security.Cryptography.X509Certificates.RSACertificateExtensions]'
+        '::GetRSAPrivateKey($c);'
+        '$kb=[Convert]::ToBase64String($rsa.ExportPkcs8PrivateKey(),"InsertLineBreaks");'
+        'Write-Output "-----BEGIN PRIVATE KEY-----";'
+        'Write-Output $kb;'
+        'Write-Output "-----END PRIVATE KEY-----"'
+    )
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+        capture_output=True, text=True, encoding="utf-8"
+    )
+    # PowerShell даёт CRLF — нормализуем перед записью
+    o = r.stdout.replace("\r\n", "\n").replace("\r", "\n")
+    c0 = o.find("-----BEGIN CERTIFICATE-----")
+    c1 = o.find("-----END CERTIFICATE-----")
+    k0 = o.find("-----BEGIN PRIVATE KEY-----")
+    k1 = o.find("-----END PRIVATE KEY-----")
+    if c0 < 0 or c1 < 0 or k0 < 0 or k1 < 0:
+        return False
+    c1 += len("-----END CERTIFICATE-----")
+    k1 += len("-----END PRIVATE KEY-----")
+    CERT_FILE.write_text(o[c0:c1].strip() + "\n", encoding="ascii")
+    KEY_FILE.write_text(o[k0:k1].strip() + "\n", encoding="ascii")
+    return has_tls()
+
+def ensure_cert() -> None:
+    """Гарантирует наличие TLS-сертификата. Вызывается при старте и перед Apply.
+    Порядок попыток: openssl → PowerShell PKI (Windows) → ошибка.
+    """
+    CERT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if has_tls():
+        return
+
+    print("  [cert] генерирую self-signed TLS сертификат…")
+
+    openssl = _find_openssl()
+    if openssl:
+        if _gen_cert_openssl(openssl):
+            print(f"  [cert] OK (openssl) → {CERT_FILE}")
+            return
+        print("  [cert] openssl завершился с ошибкой, пробую следующий метод")
+
+    if IS_WIN:
+        if _gen_cert_ps():
+            print(f"  [cert] OK (PowerShell PKI) → {CERT_FILE}")
+            return
+        print("  [cert] PowerShell PKI не сработал")
+
+    sys.exit(
+        "\n  [ОШИБКА] Не удалось сгенерировать TLS сертификат.\n"
+        "  Установи openssl (Linux: apt install openssl  |  Win: Git for Windows)\n"
+        "  и перезапусти панель.\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# sing-box config — всегда TLS, тип http
+# ---------------------------------------------------------------------------
+def _cert_path_json(p: Path) -> str:
+    """Путь для JSON-конфига sing-box: всегда forward slashes (нужно для Windows)."""
+    return str(p).replace("\\", "/")
+
+def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -> dict:
+    """
+    Inbound тип: всегда 'http' с TLS.
+    Важно: sing-box mixed inbound НЕ поддерживает TLS (нет поля tls в документации).
+    sing-box http inbound поддерживает TLS + HTTP CONNECT — используем его.
+    SOCKS5 при TLS недоступен — ограничение sing-box архитектуры.
+    Клиент должен подключаться как HTTPS-прокси + --proxy-insecure для self-signed cert.
+    """
+    inbounds, outbounds, rules = [], [], []
+    ports = calc_ports(modems, base_port)
+
+    for m in sorted(modems, key=lambda x: x["n"]):
+        n = m["n"]
+        p = ports[n]
+        inbounds.append({
+            "type": "http",
+            "tag": f"in-{n}",
+            "listen": "0.0.0.0",
+            "listen_port": p["mixed_port"],
+            "users": [{"username": f"modem{n}", "password": m["password"]}],
+            "tls": {
+                "enabled": True,
+                "certificate_path": _cert_path_json(CERT_FILE),
+                "key_path":         _cert_path_json(KEY_FILE),
+            },
+        })
+        outbounds.append({
+            "type": "direct",
+            "tag": f"out-{n}",
+            "inet4_bind_address": f"192.168.{n}.100",
+        })
+        rules.append({"inbound": [f"in-{n}"], "outbound": f"out-{n}"})
+
+    outbounds.append({"type": "direct", "tag": "direct"})
+    return {
+        "log": {"level": "warn", "timestamp": True},
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "route": {"rules": rules, "final": "direct"},
+    }
+
+
+# ---------------------------------------------------------------------------
+# sing-box — запуск / перезапуск
+# ---------------------------------------------------------------------------
+def apply_singbox(modems: list[dict], base_port: int) -> tuple[bool, str]:
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_cert()
+
+    SB_CONF.write_text(json.dumps(gen_singbox_config(modems, base_port), indent=2), encoding="utf-8")
+    if not IS_WIN:
+        SB_CONF.chmod(0o600)
+
+    r = subprocess.run([str(SINGBOX_BIN), "check", "-c", str(SB_CONF)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, strip_ansi((r.stderr or r.stdout).strip())
+
+    if IS_WIN:
+        global _sb_proc
+        if _sb_proc and _sb_proc.poll() is None:
+            _sb_proc.terminate()
+            try: _sb_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired: _sb_proc.kill()
+        subprocess.run(["taskkill", "/F", "/IM", "sing-box.exe"], capture_output=True, text=True)
+        time.sleep(0.5)
+        log_fh = open(SB_LOG, "w", encoding="utf-8")
+        _sb_proc = subprocess.Popen([str(SINGBOX_BIN), "run", "-c", str(SB_CONF)],
+                                    stdout=log_fh, stderr=log_fh)
+        time.sleep(2)
+        if _sb_proc.poll() is not None:
+            log_fh.flush()
+            return False, strip_ansi("\n".join(read_log(20))) or "crashed"
+        return True, "active"
+    else:
+        r2 = subprocess.run("systemctl restart modlink",
+                            shell=True, capture_output=True, text=True, timeout=30)
+        if r2.returncode != 0:
+            return False, strip_ansi((r2.stderr or r2.stdout).strip())
+        time.sleep(1)
+        return True, get_sb_status()
+
+if IS_WIN:
+    atexit.register(lambda: _sb_proc.terminate() if _sb_proc and _sb_proc.poll() is None else None)
+
+
+# ---------------------------------------------------------------------------
+# Huawei HiLink API
 # ---------------------------------------------------------------------------
 def _http_xml_get(url: str, headers: dict | None = None, timeout: int = 8) -> str:
     req = urllib.request.Request(url, headers=headers or {})
@@ -212,6 +407,7 @@ def reboot_huawei(webui_ip: str, timeout: int = 8) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
+
 # ---------------------------------------------------------------------------
 # Reconnect log
 # ---------------------------------------------------------------------------
@@ -240,8 +436,9 @@ def read_reconnect_log(n: int, tail: int = 60) -> list[str]:
     lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     return lines[-tail:]
 
+
 # ---------------------------------------------------------------------------
-# Reconnect mini-server (per modem, standalone /reconnect endpoint)
+# ReconnectServer — mini HTTP на порту reconn_port каждого модема
 # ---------------------------------------------------------------------------
 class _ReconnBase(BaseHTTPRequestHandler):
     _modem_n: int = 0
@@ -272,8 +469,8 @@ class ReconnectServer:
         self._thr = threading.Thread(target=self.httpd.serve_forever,
                                      daemon=True, name=f"reconn-{n}")
     def start(self):
-        try: self._thr.start(); print(f"[reconn] modem{self.n} :{self.port}")
-        except Exception as e: print(f"[reconn] modem{self.n} error: {e}")
+        try: self._thr.start(); print(f"  [reconn] modem{self.n} :{self.port}")
+        except Exception as e: print(f"  [reconn] modem{self.n} error: {e}")
     def stop(self):
         try: self.httpd.shutdown(); self.httpd.server_close()
         except Exception: pass
@@ -293,8 +490,9 @@ def rebuild_reconn_servers(modems: list[dict], base_port: int) -> None:
                 srv = ReconnectServer(n, port)
                 _reconn_servers[n] = srv; srv.start()
 
+
 # ---------------------------------------------------------------------------
-# Interval scheduler (auto-reconnect by timer)
+# IntervalJob — авто-реконнект по таймеру
 # ---------------------------------------------------------------------------
 class IntervalJob:
     def __init__(self, n: int, interval_sec: int):
@@ -302,7 +500,7 @@ class IntervalJob:
         self._stop = threading.Event()
         self._thr = threading.Thread(target=self._run, daemon=True, name=f"timer-{n}")
     def start(self):
-        print(f"[timer] modem{self.n} every {self.interval}s"); self._thr.start()
+        print(f"  [timer] modem{self.n} every {self.interval}s"); self._thr.start()
     def stop(self): self._stop.set()
     def _run(self):
         next_at = time.time() + self.interval
@@ -315,7 +513,7 @@ class IntervalJob:
             utc_s, loc_s = _now_strs()
             append_reconnect_log(self.n,
                 f"{utc_s} | {loc_s} | modem{self.n} | auto | {dt:.2f}s | {'ok' if ok else 'fail'} | {msg}")
-            print(f"[timer] modem{self.n} -> {'ok' if ok else 'fail'} in {dt:.2f}s")
+            print(f"  [timer] modem{self.n} -> {'ok' if ok else 'fail'} in {dt:.2f}s")
             next_at += self.interval
 
 _jobs: dict[int, IntervalJob] = {}
@@ -332,206 +530,12 @@ def rebuild_scheduler(modems: list[dict]) -> None:
             if n not in _jobs:
                 job = IntervalJob(n, sec); _jobs[n] = job; job.start()
 
-# ---------------------------------------------------------------------------
-# sing-box config
-# Ports per modem (sorted index i):
-#   mixed=BASE+i*2  — handles both HTTP CONNECT (HTTPS) and SOCKS5 on one port
-# No custom DNS section — sing-box uses system resolver (avoids version issues)
-# ---------------------------------------------------------------------------
-def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -> dict:
-    inbounds, outbounds, rules = [], [], []
-    tls = has_tls()
-    ports = calc_ports(modems, base_port)
-    for m in sorted(modems, key=lambda x: x["n"]):
-        p = ports[m["n"]]
-        n = m["n"]
-        inbound: dict = {
-            "type": "http" if tls else "mixed",
-            "tag": f"in-{n}",
-            "listen": "0.0.0.0",
-            "listen_port": p["mixed_port"],
-            "users": [{"username": f"modem{n}", "password": m["password"]}],
-        }
-        if tls:
-            inbound["tls"] = {"enabled": True,
-                              "certificate_path": str(CERT_FILE),
-                              "key_path": str(KEY_FILE)}
-        inbounds.append(inbound)
-        outbounds.append({
-            "type": "direct",
-            "tag": f"out-{n}",
-            "inet4_bind_address": f"192.168.{n}.100",
-        })
-        rules.append({"inbound": [f"in-{n}"], "outbound": f"out-{n}"})
-
-    outbounds.append({"type": "direct", "tag": "direct"})
-    return {
-        "log": {"level": "warn", "timestamp": True},
-        "inbounds": inbounds,
-        "outbounds": outbounds,
-        "route": {"rules": rules, "final": "direct"},
-    }
-
-_BUNDLED_CERT = """\
------BEGIN CERTIFICATE-----
-MIIDEzCCAfugAwIBAgIUekx/rYOXzGAhasTUefpS7TbHtI0wDQYJKoZIhvcNAQEL
-BQAwGTEXMBUGA1UEAwwObW9kbGluay1zZXJ2ZXIwHhcNMjYwNjAzMjIzMTE1WhcN
-MzYwNTMxMjIzMTE1WjAZMRcwFQYDVQQDDA5tb2RsaW5rLXNlcnZlcjCCASIwDQYJ
-KoZIhvcNAQEBBQADggEPADCCAQoCggEBALF9cN90IwH8/+bujseBCYuNq31zcbwY
-E9YE8AiL0+BfGOXJoojor1fpv5W6Tj6+lYYs79soBzT+CUpN44iyz9E2Gup8vqD4
-dZpS9luWpaDbYUOJTaQrNXoYb8l+w8lkPtxPFoWJc/5BgCHOYUsqT4C3TnfBpa7z
-zjiPrGCfp8MIhxtKWP8USIQoKeVkgHtbQSJsera8Ll7qrwbO8Gjl19/cMGqyk494
-leT+IDowRbW8pnrcB0YzOhharHqMajFnNCJOYz+z4L8AF4c5QN41fq8zaYTNPouq
-n4LX6pEPWAPCFvnHdyNrQreWUJZWUX9QMOjNXxCmjGhAQ9DmPeoAWc0CAwEAAaNT
-MFEwHQYDVR0OBBYEFCo8pBnBisR/vq0RK7GXEC67byIMMB8GA1UdIwQYMBaAFCo8
-pBnBisR/vq0RK7GXEC67byIMMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL
-BQADggEBAA+7csEzoJJHTdguqEDjCEYPGXfyC7KmHf7aKLIJJ2MriRkUXGqKPljx
-rRQHUN0fEE2dOzmxUAEvUBOIViDMfcBDl6VWG0Go04xbNrqIvNz/armW0Isj6TgN
-11e6VdVFJM88yArIoiiSARTvrdTqI2SgQUT91kPrj6akANhMDXAJo6Hd2gay2uAl
-gzUrie/I9KuWxuqsJbBQ9O8HLOELy3CEgRS5rUkw8RU6E6sK3JLZ0/mI2khtU+e9
-2LqKzxVu4FhlKZt+AThLX8NTjTAroGAmx9sT4SYpJUNplfGvzO8UsFxtoWWCVxMR
-3BszaCihRPAo+fGOe4LkZen65J8gXx8=
------END CERTIFICATE-----"""
-
-_BUNDLED_KEY = """\
------BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCxfXDfdCMB/P/m
-7o7HgQmLjat9c3G8GBPWBPAIi9PgXxjlyaKI6K9X6b+Vuk4+vpWGLO/bKAc0/glK
-TeOIss/RNhrqfL6g+HWaUvZblqWg22FDiU2kKzV6GG/JfsPJZD7cTxaFiXP+QYAh
-zmFLKk+At053waWu8844j6xgn6fDCIcbSlj/FEiEKCnlZIB7W0EibHq2vC5e6q8G
-zvBo5dff3DBqspOPeJXk/iA6MEW1vKZ63AdGMzoYWqx6jGoxZzQiTmM/s+C/ABeH
-OUDeNX6vM2mEzT6Lqp+C1+qRD1gDwhb5x3cja0K3llCWVlF/UDDozV8QpoxoQEPQ
-5j3qAFnNAgMBAAECggEAJhB374QxqdB/dSA+QKz8xhAI8iua/bLQNjry23JZayoZ
-5dX7ZI86Y4k+zDabZztqR89FVWPdP9EnXucbYAqxJPYMibNdEpqWZhVavkOtm7TQ
-xDIjE40st9Wby8PC62LzVD4l31eeJ64Wc6mWFg+p4znsuyQtizrAREMTvdkfmmTS
-7jEWEKakI4tSSDHZ5PJKJgWhBXJguAk0LRg1sxVuR8J8yztWsuRj5+x5JDLOSuA/
-AviTT1RPoyQ4DravEBUWnwWMJMKj8TsDW/2wfkGjUcXsefGmCJ/Em5JNcy9WjjY4
-LhZpOQt5jfetG0MBOiRP5BmNqOxnG1SZ8YrO1/WooQKBgQDrHzswu2UPQRgr4bqr
-p0bJmQXnPWCVHN1tdarn1ff5oHT2fuyvnbec56aUP8iJe0hVS2OFhXxlvYRhVfjB
-q8n/cEaS/P63WAB5fi1nr5yJyFpl6+Semc4IIpP7Enk4NhFYEwypRdSgaqXx1Ayp
-Iuz49UYASlBGEdW8ujpgzeIBeQKBgQDBQCAOKxUeFUOBSuWEfU3ppIs44B1k8H18
-5ztn8BxFbWqaoASVtdiG9piIofn3wgyI711KLuFcNLxVsKqmDI9eVLwKI7q0SaNa
-FAdN4ZFCgTn7T/DEVOn0zvkAiLeknHGEaPfoMehCSSDDifxZDcP0D0LHsqV4KHw+
-vUM3Yik59QKBgQCm1ORE8dMFfeTOzj6MKgdaaI/9wllTtMWRM5rvIa3wnGAhv3Hm
-MnzkgqJ6Mr/yfV2X2ARn642XC2BxSHVXxrNv4pTRG18JbRH5IwTIu5zRTy6Ff1ob
-B3tf3lkuH6+PqR2pZurm+TukD8hrzVCmere29yKSdih7b5A/d8yQf8XL0QKBgBCZ
-76cH8HJ7JSdwRbNSCGVv6z3hkuTe/AjE3IebSvJz6dqKsJoj2wwNFyF1uMGd+/Gv
-jnYW/Oks5pj96ksFfTN/WAAO/bULNmtAmTgJjq8F5vM99NMI8GhFd4KiPBR6FA5p
-7hIWZ3t6SMRDkFgeJJ1MylHZePmPkMza+XFCj4QZAoGAPJG4ov39NW1LB6ciRBGd
-iXcUpxfLnT5xA2/CpxTTLn4R+iWnPR6lu8rHEb60m0AiDInhyhBNrUkMYTBFTs4y
-n9nAmMJBA6YI+BT7eEXD1HdWVj2WseaHqUwoBvbcpMe5TAq4cuxcy9Zs86llqmoJ
-2nwt+LfJWSFSvEtN+8WWQDM=
------END PRIVATE KEY-----"""
-
-def _find_openssl() -> str | None:
-    found = shutil.which("openssl")
-    if found:
-        return found
-    if IS_WIN:
-        try:
-            r = subprocess.run(["where.exe", "openssl"], capture_output=True, text=True)
-            if r.returncode == 0:
-                first = r.stdout.strip().splitlines()[0]
-                if first:
-                    return first
-        except Exception:
-            pass
-        for candidate in [
-            r"C:\Program Files\Git\usr\bin\openssl.exe",
-            r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
-            r"C:\Program Files (x86)\OpenSSL-Win32\bin\openssl.exe",
-            r"C:\Program Files\OpenSSL\bin\openssl.exe",
-        ]:
-            if Path(candidate).exists():
-                return candidate
-    return None
-
-def _ensure_cert_ps() -> None:
-    ps = (
-        '$c=New-SelfSignedCertificate -DnsName modlink-server '
-        '-CertStoreLocation Cert:\\LocalMachine\\My '
-        '-NotAfter (Get-Date).AddYears(10) -KeyExportPolicy Exportable;'
-        '$cb=[Convert]::ToBase64String($c.RawData,"InsertLineBreaks");'
-        'echo "-----BEGIN CERTIFICATE-----";echo $cb;echo "-----END CERTIFICATE-----";'
-        '$rsa=[System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($c);'
-        '$kb=[Convert]::ToBase64String($rsa.ExportPkcs8PrivateKey(),"InsertLineBreaks");'
-        'echo "-----BEGIN PRIVATE KEY-----";echo $kb;echo "-----END PRIVATE KEY-----"'
-    )
-    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                       capture_output=True, text=True)
-    o = r.stdout
-    c0 = o.find("-----BEGIN CERTIFICATE-----")
-    c1 = o.find("-----END CERTIFICATE-----") + len("-----END CERTIFICATE-----")
-    k0 = o.find("-----BEGIN PRIVATE KEY-----")
-    k1 = o.find("-----END PRIVATE KEY-----") + len("-----END PRIVATE KEY-----")
-    if c0 < 0 or k0 < 0:
-        raise RuntimeError(f"PowerShell cert gen failed:\n{r.stderr}")
-    CERT_FILE.write_text(o[c0:c1], encoding="ascii")
-    KEY_FILE.write_text(o[k0:k1], encoding="ascii")
-
-def ensure_cert() -> None:
-    CERT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if has_tls():
-        return
-    openssl = _find_openssl()
-    if openssl:
-        r = subprocess.run(
-            [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-             "-keyout", str(KEY_FILE), "-out", str(CERT_FILE),
-             "-days", "3650", "-subj", "/CN=modlink-server"],
-            capture_output=True
-        )
-        if r.returncode == 0 and has_tls():
-            return
-    if IS_WIN:
-        try:
-            _ensure_cert_ps()
-            if has_tls():
-                return
-        except Exception:
-            pass
-    # fallback: write bundled self-signed cert
-    CERT_FILE.write_text(_BUNDLED_CERT, encoding="ascii")
-    KEY_FILE.write_text(_BUNDLED_KEY, encoding="ascii")
-
-def apply_singbox(modems: list[dict], base_port: int) -> tuple[bool, str]:
-    CONF_DIR.mkdir(parents=True, exist_ok=True)
-    ensure_cert()
-    SB_CONF.write_text(json.dumps(gen_singbox_config(modems, base_port), indent=2), encoding="utf-8")
-    if not IS_WIN:
-        SB_CONF.chmod(0o600)
-    r = subprocess.run([str(SINGBOX_BIN), "check", "-c", str(SB_CONF)],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        return False, strip_ansi((r.stderr or r.stdout).strip())
-    if IS_WIN:
-        global _sb_proc
-        if _sb_proc and _sb_proc.poll() is None:
-            _sb_proc.terminate()
-            try: _sb_proc.wait(timeout=3)
-            except subprocess.TimeoutExpired: _sb_proc.kill()
-        subprocess.run(["taskkill", "/F", "/IM", "sing-box.exe"], capture_output=True, text=True)
-        time.sleep(0.5)
-        log_fh = open(SB_LOG, "w", encoding="utf-8")
-        _sb_proc = subprocess.Popen([str(SINGBOX_BIN), "run", "-c", str(SB_CONF)],
-                                    stdout=log_fh, stderr=log_fh)
-        time.sleep(2)
-        if _sb_proc.poll() is not None:
-            log_fh.flush()
-            return False, strip_ansi("\n".join(read_log(20))) or "crashed"
-        return True, "active"
-    else:
-        r2 = subprocess.run("systemctl restart modlink",
-                            shell=True, capture_output=True, text=True, timeout=30)
-        if r2.returncode != 0:
-            return False, strip_ansi((r2.stderr or r2.stdout).strip())
-        time.sleep(1); return True, get_sb_status()
-
-if IS_WIN:
-    atexit.register(lambda: _sb_proc.terminate() if _sb_proc and _sb_proc.poll() is None else None)
 atexit.register(lambda: [j.stop() for j in list(_jobs.values())])
 atexit.register(lambda: [s.stop() for s in list(_reconn_servers.values())])
 
+
+# ---------------------------------------------------------------------------
+# HTTP API + HTML панель
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
@@ -576,9 +580,9 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/modems":
             modems = load_modems()
-            sconf = load_server_conf()
-            base = sconf.get("base_port", DEFAULT_BASE_PORT)
-            ports = calc_ports(modems, base)
+            sconf  = load_server_conf()
+            base   = sconf.get("base_port", DEFAULT_BASE_PORT)
+            ports  = calc_ports(modems, base)
             ext_ip = sconf.get("ext_ip", "") or get_local_ip()
             result = []
             for m in modems:
@@ -608,13 +612,12 @@ class Handler(BaseHTTPRequestHandler):
             m = next((x for x in modems if x["n"] == n), None)
             if not m: return self._json({"error": f"modem {n} not found"}, 404)
             sconf = load_server_conf()
-            base = sconf.get("base_port", DEFAULT_BASE_PORT)
-            p = calc_ports(modems, base).get(n, {})
+            base  = sconf.get("base_port", DEFAULT_BASE_PORT)
+            p     = calc_ports(modems, base).get(n, {})
             mixed_port = p.get("mixed_port", base + n)
-            scheme = "https" if has_tls() else "http"
-            proxy = f"{scheme}://modem{n}:{m['password']}@127.0.0.1:{mixed_port}"
-            insecure = "--proxy-insecure" if has_tls() else ""
-            curl_cmd = f'curl -s --max-time 8 --proxy "{proxy}" {insecure}'.strip()
+            # TLS всегда включён — используем https схему и --proxy-insecure
+            proxy    = f"https://modem{n}:{m['password']}@127.0.0.1:{mixed_port}"
+            curl_cmd = f'curl -s --max-time 8 --proxy "{proxy}" --proxy-insecure'
             r1 = subprocess.run(f"{curl_cmd} http://ip.me",
                                 shell=True, capture_output=True, text=True, timeout=12)
             r2 = subprocess.run(f"{curl_cmd} http://192.168.{n}.1/api/webserver/SesTokInfo",
@@ -689,6 +692,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
+
+# ---------------------------------------------------------------------------
+# HTML / JS панель
 # ---------------------------------------------------------------------------
 HTML_PAGE = """\
 <!DOCTYPE html>
@@ -714,6 +720,9 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 .chip-label{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin-right:2px}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0;transition:background .3s}
 .dot.on{background:var(--success);box-shadow:0 0 5px var(--success)}.dot.off{background:var(--error)}
+.tls-badge{font-size:11px;padding:3px 8px;border-radius:var(--r);font-weight:600}
+.tls-badge.on{background:rgba(63,185,80,.15);border:1px solid var(--success);color:var(--success)}
+.tls-badge.off{background:rgba(248,81,73,.15);border:1px solid var(--error);color:var(--error)}
 .sconf{display:flex;align-items:center;gap:8px;background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:9px 14px;margin-bottom:12px;flex-wrap:wrap}
 .sconf-label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
 .sconf input{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:13px;font-family:monospace;padding:4px 8px;outline:none;transition:border-color .15s;width:160px}
@@ -775,6 +784,7 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
     <div class="chips">
       <div class="chip"><span class="chip-label">IP</span><span id="localIp">…</span></div>
       <div class="chip"><div class="dot" id="dot"></div><span id="srvStatus">…</span></div>
+      <span id="tlsBadge" class="tls-badge">TLS …</span>
     </div>
   </div>
 
@@ -793,7 +803,7 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
       <thead><tr>
         <th class="col-n">N</th>
         <th class="col-login">Логин</th>
-        <th class="col-ports">Порт (mix)</th>
+        <th class="col-ports">Порт (proxy)</th>
         <th class="col-reconn">Реконнект URL</th>
         <th class="col-pass">Пароль</th>
         <th class="col-interval">Интервал<br><span style="font-size:9px;font-weight:400">(мин,0=выкл)</span></th>
@@ -841,7 +851,7 @@ input[readonly]{color:var(--muted);cursor:default;background:var(--surface2)}
 <div class="toasts" id="toasts"></div>
 
 <script>
-let localIp='', extIp='', basePort=10000, confDirty=false, hasTls=false;
+let localIp='', extIp='', basePort=10000, confDirty=false;
 let _reconnLogN=0;
 
 window.onerror=function(msg,src,line){toast('JS: '+msg+' ('+line+')','err',12000);return false;};
@@ -857,10 +867,6 @@ function randPass(len=10){
 }
 function markDirty(){confDirty=true;document.getElementById('saveConfBtn').style.display='';}
 
-function getPortsForIndex(idx){
-  const bp=parseInt(document.getElementById('basePort').value)||10000;
-  return {http:bp+idx*3, socks:bp+idx*3+1, reconn:bp+idx*3+2};
-}
 function getSortedNs(){
   return [...document.querySelectorAll('#tbody tr[data-n]')]
     .map(tr=>parseInt(tr.dataset.n)).filter(n=>n>0).sort((a,b)=>a-b);
@@ -869,16 +875,18 @@ function getSortedNs(){
 function refreshComputedPorts(){
   const ns=getSortedNs();
   const ip=document.getElementById('extIp').value.trim()||localIp||'...';
+  const bp=parseInt(document.getElementById('basePort').value)||10000;
   document.querySelectorAll('#tbody tr[data-n]').forEach(tr=>{
     const n=parseInt(tr.dataset.n);
-    const idx=ns.indexOf(n);if(idx<0)return;
-    const bp=parseInt(document.getElementById('basePort').value)||10000;
-    const mp=bp+idx*2; const rp=bp+idx*2+1;
+    const idx=ns.indexOf(n); if(idx<0) return;
+    const mp=bp+idx*2;
+    const rp=bp+idx*2+1;
     const portsDiv=tr.querySelector('.ports-val');
-    if(portsDiv)portsDiv.innerHTML=`<span>${mp}</span>`;
+    if(portsDiv) portsDiv.innerHTML=`<span>${mp}</span>`;
     const reconnInp=tr.querySelector('.inp-reconn');
-    if(reconnInp)reconnInp.value=`http://${ip}:${rp}/reconnect`;
-    tr.dataset.mixedPort=mp;tr.dataset.reconnPort=rp;
+    if(reconnInp) reconnInp.value=`http://${ip}:${rp}/reconnect`;
+    tr.dataset.mixedPort=mp;
+    tr.dataset.reconnPort=rp;
   });
 }
 
@@ -947,11 +955,14 @@ function getRows(){
 async function loadInfo(){
   try{
     const d=await fetch('/api/info').then(r=>r.json());
-    localIp=d.local_ip;basePort=d.base_port;hasTls=d.tls||false;
+    localIp=d.local_ip; basePort=d.base_port;
     document.getElementById('localIp').textContent=d.local_ip;
     const dot=document.getElementById('dot');
     dot.className='dot '+(d.status==='active'?'on':'off');
     document.getElementById('srvStatus').textContent=d.status;
+    const tb=document.getElementById('tlsBadge');
+    tb.className='tls-badge '+(d.tls?'on':'off');
+    tb.textContent=d.tls?'TLS ON':'TLS OFF';
     if(!confDirty){
       document.getElementById('extIp').value=d.ext_ip||'';
       document.getElementById('basePort').value=d.base_port;
@@ -1068,7 +1079,7 @@ async function refreshReconnLog(){
       if(l.includes('| fail |'))return`<span class="err">${s}</span>`;
       if(l.includes('| reboot |'))return`<span class="warn">${s}</span>`;
       return s;
-    }).join('\\n');
+    }).join('\n');
     el.scrollTop=el.scrollHeight;
   }catch(e){el.textContent='Ошибка';}
 }
@@ -1078,13 +1089,12 @@ function copyClient(){
   const rows=getRows();
   if(!rows.length){toast('Нет модемов','err');return;}
   const ip=document.getElementById('extIp').value.trim()||localIp;
-  // формат: IP:PORT:login:pass \t http://IP:RECONN/reconnect
   const lines=rows.map(m=>{
     const mp=m._mp||'?';
     const ru=m._ru||'?';
-    return `${ip}:${mp}:modem${m.n}:${m.password}\\t${ru}`;
+    return `${ip}:${mp}:modem${m.n}:${m.password}\t${ru}`;
   });
-  const text=lines.join('\\n');
+  const text=lines.join('\n');
   navigator.clipboard.writeText(text)
     .then(()=>toast(`Скопировано ${lines.length} строк`,'ok'))
     .catch(()=>{const ta=document.createElement('textarea');ta.value=text;
@@ -1101,19 +1111,20 @@ async function refreshLogs(){
       const cls=l.match(/FATAL|ERROR/i)?'err':l.match(/WARN/i)?'warn':l.match(/started|active/i)?'ok':'';
       const s=l.replace(/&/g,'&amp;').replace(/</g,'&lt;');
       return cls?`<span class="${cls}">${s}</span>`:s;
-    }).join('\\n');
+    }).join('\n');
     el.scrollTop=el.scrollHeight;
   }catch(e){el.textContent='Ошибка';}
 }
 function openLogs(){document.getElementById('logModal').classList.add('open');refreshLogs();}
 function closeLogs(){document.getElementById('logModal').classList.remove('open');}
 
-document.title='modlink ✓';
+document.title='modlink';
 try{loadInfo();loadModems();}catch(e){document.title='ERR:'+e.message;}
 setInterval(loadInfo,8000);
 </script>
 </body>
 </html>"""
+
 
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -1123,6 +1134,10 @@ def main() -> None:
     p.add_argument("--no-browser", action="store_true")
     a = p.parse_args()
 
+    # TLS сертификат генерируется при старте — до запуска sing-box и API
+    print("  [modlink] старт панели…")
+    ensure_cert()
+
     try:
         modems = load_modems()
         sconf  = load_server_conf()
@@ -1130,10 +1145,11 @@ def main() -> None:
         rebuild_reconn_servers(modems, base)
         rebuild_scheduler(modems)
     except Exception as e:
-        print(f"[startup] {e}")
+        print(f"  [startup] {e}")
 
     url = f"http://{a.host}:{a.port}"
-    print(f"  modlink panel → {url}")
+    print(f"  [modlink] панель   → {url}")
+    print(f"  [modlink] TLS cert → {CERT_FILE}")
     if not a.no_browser:
         webbrowser.open(url)
     server = ThreadingHTTPServer((a.host, a.port), Handler)

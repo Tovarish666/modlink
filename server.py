@@ -207,16 +207,15 @@ def cmd_status(modems: list[Modem]) -> None:
     r = sh(f"systemctl is-active {SYSTEMD_SVC}")
     print(f"  sing-box ({SYSTEMD_SVC}): {r.stdout.strip() or '—'}")
 
-    # проверить что порт слушает
-    r = sh(f"ss -tlnp | grep :{PROXY_PORT}")
-    print(f"  порт {PROXY_PORT}: {'слушает' if r.returncode == 0 else 'не слушает'}")
-
-    print(f"\n  {'N':>3}  {'bind IP':<18}  {'user':<12}  {'iface up?'}")
+    print(f"\n  {'N':>3}  {'port':<8}  {'bind IP':<18}  {'user':<12}  {'iface up?'}")
     for m in modems:
+        port = BASE_PORT + m.n
+        r = sh(f"ss -tlnp | grep :{port}")
+        port_status = "слушает" if r.returncode == 0 else "нет"
         r = sh(f"ip link show | grep -w '{m.bind_ip}\\|192\\.168\\.{m.n}\\.'")
         iface_r = sh(f"ip addr show | grep -w '{m.bind_ip}'")
         iface_up = "OK" if iface_r.returncode == 0 else "нет адреса"
-        print(f"  {m.n:>3}  {m.bind_ip:<18}  {m.username:<12}  {iface_up}")
+        print(f"  {m.n:>3}  {port:<8}  {m.bind_ip:<18}  {m.username:<12}  {iface_up} / порт {port_status}")
 
 
 def cmd_test(n: int, server_addr: str = "127.0.0.1") -> None:
