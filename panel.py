@@ -309,11 +309,12 @@ def _cert_path_json(p: Path) -> str:
 
 def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -> dict:
     """
-    Inbound тип: всегда 'http' с TLS.
-    Важно: sing-box mixed inbound НЕ поддерживает TLS (нет поля tls в документации).
-    sing-box http inbound поддерживает TLS + HTTP CONNECT — используем его.
-    SOCKS5 при TLS недоступен — ограничение sing-box архитектуры.
-    Клиент должен подключаться как HTTPS-прокси + --proxy-insecure для self-signed cert.
+    Inbound тип: mixed (HTTP CONNECT + SOCKS5, без TLS на канале прокси).
+    Клиент подключается plain HTTP/SOCKS5 — формат IP:PORT:LOGIN:PASS работает
+    во всех стандартных инструментах без дополнительных настроек.
+    TLS к целевым сайтам (HTTPS) работает через CONNECT-туннель независимо.
+    sing-box mixed inbound не поддерживает TLS — для TLS на канале нужен http inbound,
+    но тогда теряется SOCKS5 и совместимость со стандартными клиентами.
     """
     inbounds, outbounds, rules = [], [], []
     ports = calc_ports(modems, base_port)
@@ -322,16 +323,11 @@ def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -
         n = m["n"]
         p = ports[n]
         inbounds.append({
-            "type": "http",
+            "type": "mixed",
             "tag": f"in-{n}",
             "listen": "0.0.0.0",
             "listen_port": p["mixed_port"],
             "users": [{"username": f"modem{n}", "password": m["password"]}],
-            "tls": {
-                "enabled": True,
-                "certificate_path": _cert_path_json(CERT_FILE),
-                "key_path":         _cert_path_json(KEY_FILE),
-            },
         })
         outbounds.append({
             "type": "direct",
@@ -675,9 +671,8 @@ class Handler(BaseHTTPRequestHandler):
             base  = sconf.get("base_port", DEFAULT_BASE_PORT)
             p     = calc_ports(modems, base).get(n, {})
             mixed_port = p.get("mixed_port", base + n)
-            # TLS всегда включён — используем https схему и --proxy-insecure
-            proxy    = f"https://modem{n}:{m['password']}@127.0.0.1:{mixed_port}"
-            curl_cmd = f'curl -s --max-time 8 --proxy "{proxy}" --proxy-insecure'
+            proxy    = f"http://modem{n}:{m['password']}@127.0.0.1:{mixed_port}"
+            curl_cmd = f'curl -s --max-time 8 --proxy "{proxy}"'
             r1 = subprocess.run(f"{curl_cmd} http://ip.me",
                                 shell=True, capture_output=True, text=True, timeout=12)
             r2 = subprocess.run(f"{curl_cmd} http://192.168.{n}.1/api/webserver/SesTokInfo",
