@@ -112,8 +112,9 @@ fi
 # Отключаем дефолтный сервис sing-box — используем свой modlink.service
 systemctl disable --now sing-box.service >/dev/null 2>&1 || true
 
-# Симлинк чтобы путь был стабильным в юнитах
-ln -sf "$SB_BIN" /usr/local/bin/sing-box
+# Определяем реальный путь бинаря (не создаём симлинк — он может зациклиться)
+REAL_SB="$(readlink -f "$SB_BIN" 2>/dev/null || echo "$SB_BIN")"
+SB_BIN="$REAL_SB"
 
 # ── 4. Директории и скрипты ───────────────────────────────────────────────────
 info "Скачиваю panel.py и server.py..."
