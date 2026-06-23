@@ -2,11 +2,12 @@
 """
 modlink server — серверная часть (хосты с модемами).
 
-Поднимает sing-box как HTTPS-прокси.  Каждый модем N:
-  • слушает на одном порту (PROXY_PORT), TLS
+Поднимает sing-box как mixed (HTTP CONNECT + SOCKS5) прокси.
+Каждый модем N:
+  • слушает на BASE_PORT + sorted_index * 2  (такой же порядок, как в panel.py)
   • auth: username=modem-N  password=из modems.conf
   • outbound: direct, inet4_bind_address=192.168.N.100
-  • Huawei .1 доступен через CONNECT 192.168.N.1 (L2 локально)
+  • Huawei .1 доступен через CONNECT 192.168.N.1
 
 modems.conf: одна строка = один модем
     N password
@@ -16,24 +17,20 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import ipaddress
 import json
-import os
 import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
 CONF_DIR    = Path("/etc/modlink")
 MODEMS_CONF = CONF_DIR / "modems.conf"
 SB_CONF     = CONF_DIR / "singbox.json"
-CERT_FILE   = CONF_DIR / "cert.pem"
-KEY_FILE    = CONF_DIR / "key.pem"
 
-BASE_PORT   = 10000    # порт модема N = BASE_PORT + N
+BASE_PORT   = 10000
 HOST_OCTET  = 100      # 192.168.N.100 — адрес интерфейса модема на хосте
 SINGBOX_BIN = shutil.which("sing-box") or "/usr/local/bin/sing-box"
 SYSTEMD_SVC = "modlink"
@@ -46,15 +43,13 @@ class Modem:
     password: str
 
     @property
-    def net(self) -> str:           return f"192.168.{self.n}"
+    def net(self) -> str:       return f"192.168.{self.n}"
     @property
-    def bind_ip(self) -> str:       return f"{self.net}.{HOST_OCTET}"
+    def bind_ip(self) -> str:   return f"{self.net}.{HOST_OCTET}"
     @property
-    def username(self) -> str:      return f"modem{self.n}"
+    def username(self) -> str:  return f"modem{self.n}"
     @property
-    def huawei_ip(self) -> str:     return f"{self.net}.1"
-    @property
-    def tag(self) -> str:           return f"out-{self.n}"
+    def huawei_ip(self) -> str: return f"{self.net}.1"
 
 
 def _auto_pass(n: int) -> str:
@@ -92,67 +87,47 @@ def load_modems() -> list[Modem]:
 
 
 # ---------------------------------------------------------------------------
+def calc_ports(modems: list[Modem]) -> dict[int, int]:
+    """Возвращает {modem_n: mixed_port} — тот же алгоритм, что в panel.py."""
+    return {m.n: BASE_PORT + i * 2 for i, m in enumerate(sorted(modems, key=lambda x: x.n))}
+
+
 def gen_singbox_config(modems: list[Modem]) -> dict:
     """
-    Порт-per-модем: HTTP inbound с TLS на BASE_PORT + N.
-    Маршрутизация по inbound тегу — изоляция отказов, удобный мониторинг.
+    mixed inbound (HTTP CONNECT + SOCKS5) на канале прокси.
+    Порт модема = BASE_PORT + sorted_index * 2  (совпадает с panel.py).
     """
-    tls = CERT_FILE.exists() and KEY_FILE.exists()
+    ports = calc_ports(modems)
     inbounds, outbounds, rules = [], [], []
-    for m in modems:
-        port    = BASE_PORT + m.n
-        tag_in  = f"in-{m.n}"
-        tag_out = f"out-{m.n}"
-        inbound: dict = {
-            "type": "http" if tls else "mixed",
-            "tag": tag_in,
+    for m in sorted(modems, key=lambda x: x.n):
+        port = ports[m.n]
+        inbounds.append({
+            "type": "mixed",
+            "tag": f"in-{m.n}",
             "listen": "0.0.0.0",
             "listen_port": port,
             "users": [{"username": m.username, "password": m.password}],
-        }
-        if tls:
-            inbound["tls"] = {
-                "enabled": True,
-                "certificate_path": str(CERT_FILE),
-                "key_path": str(KEY_FILE),
-            }
-        inbounds.append(inbound)
+        })
         outbounds.append({
             "type": "direct",
-            "tag": tag_out,
+            "tag": f"out-{m.n}",
             "inet4_bind_address": m.bind_ip,
         })
-        rules.append({"inbound": [tag_in], "outbound": tag_out})
+        rules.append({"inbound": [f"in-{m.n}"], "outbound": f"out-{m.n}"})
+    outbounds.append({"type": "direct", "tag": "direct"})
     return {
         "log": {"level": "warn", "timestamp": True},
         "inbounds": inbounds,
         "outbounds": outbounds,
-        "route": {"rules": rules},
+        "route": {"rules": rules, "final": "direct"},
     }
 
 
 # ---------------------------------------------------------------------------
-def ensure_cert() -> None:
-    if CERT_FILE.exists() and KEY_FILE.exists():
-        return
-    print("  генерирую self-signed TLS cert...")
-    cmd = (
-        f"openssl req -x509 -newkey rsa:2048 -nodes "
-        f"-keyout {KEY_FILE} -out {CERT_FILE} "
-        f"-days 3650 -subj '/CN=proxyveth-server'"
-    )
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if r.returncode != 0:
-        sys.exit(f"openssl failed:\n{r.stderr}")
-    CERT_FILE.chmod(0o644)
-    KEY_FILE.chmod(0o600)
-    print(f"  cert: {CERT_FILE}")
-
-
 def ensure_systemd_unit() -> None:
     unit = f"""\
 [Unit]
-Description=modlink — HTTPS proxy server for modems
+Description=modlink — sing-box proxy for modems
 After=network-online.target
 Wants=network-online.target
 
@@ -160,14 +135,14 @@ Wants=network-online.target
 ExecStart={SINGBOX_BIN} run -c {SB_CONF}
 Restart=always
 RestartSec=3
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
 """
     path = Path(f"/etc/systemd/system/{SYSTEMD_SVC}.service")
     path.write_text(unit)
-    subprocess.run("systemctl daemon-reload", shell=True)
+    subprocess.run("systemctl daemon-reload", shell=True, capture_output=True)
+    subprocess.run(f"systemctl enable {SYSTEMD_SVC}", shell=True, capture_output=True)
 
 
 def sh(cmd: str, timeout: int = 15) -> subprocess.CompletedProcess:
@@ -176,9 +151,7 @@ def sh(cmd: str, timeout: int = 15) -> subprocess.CompletedProcess:
 
 # ---------------------------------------------------------------------------
 def cmd_apply(modems: list[Modem]) -> None:
-    """Сгенерировать конфиг, (пере)запустить sing-box."""
     CONF_DIR.mkdir(parents=True, exist_ok=True)
-    ensure_cert()
     ensure_systemd_unit()
 
     cfg = gen_singbox_config(modems)
@@ -186,7 +159,6 @@ def cmd_apply(modems: list[Modem]) -> None:
     SB_CONF.chmod(0o600)
     print(f"  конфиг: {SB_CONF}  ({len(modems)} модемов)")
 
-    # валидация конфига sing-box
     r = sh(f"{SINGBOX_BIN} check -c {SB_CONF}")
     if r.returncode != 0:
         sys.exit(f"sing-box check failed:\n{r.stdout}\n{r.stderr}")
@@ -207,47 +179,41 @@ def cmd_status(modems: list[Modem]) -> None:
     r = sh(f"systemctl is-active {SYSTEMD_SVC}")
     print(f"  sing-box ({SYSTEMD_SVC}): {r.stdout.strip() or '—'}")
 
-    print(f"\n  {'N':>3}  {'port':<8}  {'bind IP':<18}  {'user':<12}  {'iface up?'}")
-    for m in modems:
-        port = BASE_PORT + m.n
-        r = sh(f"ss -tlnp | grep :{port}")
-        port_status = "слушает" if r.returncode == 0 else "нет"
-        r = sh(f"ip link show | grep -w '{m.bind_ip}\\|192\\.168\\.{m.n}\\.'")
+    ports = calc_ports(modems)
+    print(f"\n  {'N':>3}  {'port':<8}  {'bind IP':<18}  {'user':<12}  iface up?")
+    for m in sorted(modems, key=lambda x: x.n):
+        port = ports[m.n]
+        r_port = sh(f"ss -tlnp | grep :{port}")
+        port_status = "слушает" if r_port.returncode == 0 else "нет"
         iface_r = sh(f"ip addr show | grep -w '{m.bind_ip}'")
         iface_up = "OK" if iface_r.returncode == 0 else "нет адреса"
         print(f"  {m.n:>3}  {port:<8}  {m.bind_ip:<18}  {m.username:<12}  {iface_up} / порт {port_status}")
 
 
 def cmd_test(n: int, server_addr: str = "127.0.0.1") -> None:
-    """Тест конкретного модема: exit IP + Huawei .1 API."""
     modems = load_modems()
     m_list = [m for m in modems if m.n == n]
     if not m_list:
         sys.exit(f"модем {n} не найден в {MODEMS_CONF}")
     m = m_list[0]
 
-    port      = BASE_PORT + m.n
-    tls       = CERT_FILE.exists() and KEY_FILE.exists()
-    scheme    = "https" if tls else "http"
-    proxy_url = f"{scheme}://{m.username}:{m.password}@{server_addr}:{port}"
-    insecure  = "--proxy-insecure" if tls else ""
-    curl_base = f"curl -s --max-time 10 {insecure} --proxy '{proxy_url}'"
+    ports = calc_ports(modems)
+    port = ports[m.n]
+    proxy_url = f"http://{m.username}:{m.password}@{server_addr}:{port}"
+    curl_base = f"curl -s --max-time 10 --proxy '{proxy_url}'"
 
     print(f"  модем {m.n}  bind={m.bind_ip}  порт={port}")
     print(f"  прокси: {server_addr}:{port}  user={m.username}")
 
-    # exit IP
     r = sh(f"{curl_base} http://ip.me", timeout=15)
     exit_ip = r.stdout.strip()
     print(f"\n  exit IP:       {exit_ip or '— (таймаут)'}")
 
-    # Huawei .1
     huawei_url = f"http://{m.huawei_ip}/api/webserver/SesTokInfo"
     r = sh(f"{curl_base} '{huawei_url}'", timeout=15)
     ok = "SesInfo" in (r.stdout or "")
     print(f"  Huawei .1 API: {'OK' if ok else '— ' + (r.stderr or r.stdout or 'нет ответа')[:60]}")
 
-    # итог
     if exit_ip and ok:
         print("\n  [OK] прокся работает, Huawei API доступен")
     elif exit_ip:
@@ -258,12 +224,12 @@ def cmd_test(n: int, server_addr: str = "127.0.0.1") -> None:
 
 
 def cmd_show_creds(modems: list[Modem]) -> None:
-    """Напечатать строки для modems.conf на клиентской стороне."""
     host = sh("hostname -I | awk '{print $1}'").stdout.strip() or "SERVER_IP"
-    print(f"# Строки для /etc/proxyveth/modems.conf на клиенте")
-    print(f"# (заменить SERVER_IP на реальный IP этого сервера)")
-    for m in modems:
-        port = BASE_PORT + m.n
+    ports = calc_ports(modems)
+    print("# Строки для /etc/modlink-client/modems.conf на клиенте")
+    print("# (заменить SERVER_IP на реальный IP этого сервера)")
+    for m in sorted(modems, key=lambda x: x.n):
+        port = ports[m.n]
         print(f"{host}:{port}:{m.username}:{m.password}")
 
 

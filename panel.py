@@ -348,6 +348,28 @@ def gen_singbox_config(modems: list[dict], base_port: int = DEFAULT_BASE_PORT) -
 # ---------------------------------------------------------------------------
 # sing-box — запуск / перезапуск
 # ---------------------------------------------------------------------------
+def ensure_systemd_unit() -> None:
+    """Создаёт systemd-юнит modlink если его нет, включает автозапуск."""
+    unit_path = Path("/etc/systemd/system/modlink.service")
+    unit = f"""\
+[Unit]
+Description=modlink — sing-box proxy for modems
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart={str(SINGBOX_BIN)} run -c {str(SB_CONF)}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+"""
+    unit_path.write_text(unit)
+    subprocess.run("systemctl daemon-reload", shell=True, capture_output=True)
+    subprocess.run("systemctl enable modlink", shell=True, capture_output=True)
+
+
 def apply_singbox(modems: list[dict], base_port: int) -> tuple[bool, str]:
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     ensure_cert()
@@ -378,6 +400,7 @@ def apply_singbox(modems: list[dict], base_port: int) -> tuple[bool, str]:
             return False, strip_ansi("\n".join(read_log(20))) or "crashed"
         return True, "active"
     else:
+        ensure_systemd_unit()
         r2 = subprocess.run("systemctl restart modlink",
                             shell=True, capture_output=True, text=True, timeout=30)
         if r2.returncode != 0:
