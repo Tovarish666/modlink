@@ -117,8 +117,15 @@ ln -sf "$SB_BIN" /usr/local/bin/sing-box
 
 # ── 4. Директории и скрипты ───────────────────────────────────────────────────
 info "Скачиваю panel.py и server.py..."
-curl -fsSL "$REPO_RAW/server.py" -o "$MODLINK_DIR/modlink-server" && chmod +x "$MODLINK_DIR/modlink-server"
-curl -fsSL "$REPO_RAW/panel.py"  -o "$MODLINK_DIR/modlink-panel"  && chmod +x "$MODLINK_DIR/modlink-panel"
+curl -fsSL --max-time 30 --retry 3 --retry-delay 2 \
+    "$REPO_RAW/server.py" -o "$MODLINK_DIR/modlink-server" \
+    || abort "Не удалось скачать server.py (raw.githubusercontent.com недоступен?)"
+chmod +x "$MODLINK_DIR/modlink-server"
+
+curl -fsSL --max-time 30 --retry 3 --retry-delay 2 \
+    "$REPO_RAW/panel.py" -o "$MODLINK_DIR/modlink-panel" \
+    || abort "Не удалось скачать panel.py (raw.githubusercontent.com недоступен?)"
+chmod +x "$MODLINK_DIR/modlink-panel"
 ok "modlink-server  modlink-panel"
 
 # ── 5. Конфиги ────────────────────────────────────────────────────────────────
