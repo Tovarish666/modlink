@@ -59,11 +59,34 @@ if command -v sing-box >/dev/null 2>&1; then
     SB_BIN="$(command -v sing-box)"
     ok "sing-box уже есть: $SB_BIN"
 else
-    info "Скачиваю sing-box..."
-    bash <(curl -fsSL https://sing-box.app/installer.sh)
-    SB_BIN="$(command -v sing-box 2>/dev/null || echo "")"
-    [ -n "$SB_BIN" ] || abort "sing-box не установился"
-    ok "sing-box: $(sing-box version 2>&1 | head -1)"
+    info "Скачиваю sing-box с GitHub Releases..."
+
+    TAG=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+          | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+    [ -n "$TAG" ] || abort "Не удалось получить последний тег sing-box с GitHub"
+    VER="${TAG#v}"
+
+    MACHINE="$(uname -m)"
+    case "$MACHINE" in
+        x86_64)         ARCH="amd64"  ;;
+        aarch64|arm64)  ARCH="arm64"  ;;
+        armv7*|armhf)   ARCH="armv7"  ;;
+        *)              ARCH="amd64"  ;;
+    esac
+
+    ARCHIVE="sing-box-${VER}-linux-${ARCH}.tar.gz"
+    URL="https://github.com/SagerNet/sing-box/releases/download/${TAG}/${ARCHIVE}"
+    TMP_DIR="$(mktemp -d)"
+
+    curl -fsSL "$URL" -o "$TMP_DIR/$ARCHIVE" || abort "Не удалось скачать $URL"
+    tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
+    FOUND="$(find "$TMP_DIR" -name "sing-box" -type f | head -1)"
+    [ -n "$FOUND" ] || abort "sing-box бинарь не найден в архиве"
+    install -m 0755 "$FOUND" /usr/local/bin/sing-box
+    rm -rf "$TMP_DIR"
+
+    SB_BIN="/usr/local/bin/sing-box"
+    ok "sing-box $VER ($ARCH)"
 fi
 
 # Отключаем дефолтный сервис sing-box — используем свой modlink.service
