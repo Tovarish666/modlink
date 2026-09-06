@@ -1,0 +1,9 @@
+build/
+dist/
+res/3proxy.exe
+res/3proxy.version.txt
+*.obj
+*.res
+*.pdb
+*.ilk
+*.exe
