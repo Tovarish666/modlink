@@ -33,6 +33,7 @@ if errorlevel 1 exit /b 1
 echo   compiling...
 REM /utf-8 matters: the sources carry Cyrillic inside L"" literals.
 cl.exe /nologo /W3 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
+   /D_WINSOCK_DEPRECATED_NO_WARNINGS ^
    /Isrc /Fobuild\ /Fdbuild\ ^
    src\main.c src\util.c src\json.c src\config.c src\proxy3.c ^
    src\net.c src\hilink.c src\reconn.c src\ui_theme.c src\ui_main.c ^
@@ -61,8 +62,12 @@ if errorlevel 1 (
 
 echo   compiling agent...
 REM Agent side: serves the modem web UI on a virtual address over SOCKS5.
+REM Objects go to their own directory: /Fo without a trailing backslash is read
+REM as a single output filename, which MSVC rejects for multiple sources.
+if not exist build\agent mkdir build\agent
 cl.exe /nologo /W3 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
-   /Isrc /Fobuild\a_ /Fdbuild\a_ ^
+   /D_WINSOCK_DEPRECATED_NO_WARNINGS ^
+   /Isrc /Fobuild\agent\ /Fdbuild\agent\ ^
    src\agent_main.c src\util.c src\json.c src\socks5.c src\mediator.c ^
    /link /SUBSYSTEM:CONSOLE /OUT:build\modlink-agent.exe ^
    ws2_32.lib advapi32.lib shell32.lib ole32.lib winhttp.lib user32.lib
