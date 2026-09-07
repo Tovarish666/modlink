@@ -29,13 +29,11 @@
 /* ---------------------------------------------------------------- modem */
 typedef struct {
     int   id;                       /* stable, never reused, not shown to user */
-    int   n;                        /* modem number — label only, no longer load-bearing */
-    char  name  [ML_NAME_LEN];      /* free-text label */
+    int   n;                        /* modem number — shown as the first column */
     char  login [ML_LOGIN_LEN];     /* proxy username        — editable */
     char  pass  [ML_PASS_LEN];      /* proxy password        — editable */
     char  lan_ip[ML_ADDR_LEN];      /* 3proxy -e : outbound bind = modem iface on host */
-    char  modem_ip[ML_ADDR_LEN];    /* Huawei HiLink web UI host (was 192.168.N.1)     */
-    char  listen_ip[ML_ADDR_LEN];   /* 3proxy -i : listen address, default 0.0.0.0     */
+    char  modem_ip[ML_ADDR_LEN];    /* Huawei HiLink web UI host */
     int   proxy_port;               /* 3proxy `auto` service port */
     int   reconn_port;              /* our own reconnect HTTP listener port */
     int   interval_min;             /* auto-reconnect period, 0 = off */
@@ -52,7 +50,10 @@ enum { ML_TEST_NONE = 0, ML_TEST_PENDING, ML_TEST_OK, ML_TEST_FAIL };
 /* ---------------------------------------------------------------- config */
 typedef struct {
     char  wan_ip[ML_ADDR_LEN];      /* external IP: manual or auto-detected */
-    char  lan_ip[ML_ADDR_LEN];      /* host LAN IP: manual or auto-detected */
+    /* Host address on the main network. Doubles as 3proxy's -i for every
+     * service — there is one host, so a per-modem listen address was just a
+     * column nobody would ever fill in differently. */
+    char  lan_ip[ML_ADDR_LEN];
     BOOL  wan_auto;                 /* re-detect WAN on startup */
     BOOL  lan_auto;                 /* re-detect LAN on startup */
     int   base_port;                /* only SUGGESTS ports for newly added rows */

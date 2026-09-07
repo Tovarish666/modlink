@@ -58,7 +58,6 @@ int cfg_add_modem(Config *c)
     memset(m, 0, sizeof(*m));
     m->id = max_id + 1;
     m->n  = max_n + 1;
-    snprintf(m->name,  sizeof(m->name),  "modem%d", m->n);
     snprintf(m->login, sizeof(m->login), "modem%d", m->n);
     ml_rand_pass(m->pass, sizeof(m->pass), 10);
 
@@ -66,7 +65,6 @@ int cfg_add_modem(Config *c)
      * start out sensible, but they are plain editable text from here on. */
     snprintf(m->lan_ip,   sizeof(m->lan_ip),   "192.168.%d.100", m->n);
     snprintf(m->modem_ip, sizeof(m->modem_ip), "192.168.%d.1",   m->n);
-    ml_strlcpy(m->listen_ip, "0.0.0.0", sizeof(m->listen_ip));
 
     m->proxy_port   = cfg_suggest_port(c, FALSE);
     c->count++;                               /* count first so the reconnect  */
@@ -151,11 +149,6 @@ int cfg_validate(const Config *c, char *err, size_t errcap)
             snprintf(err, errcap, "Строка %d (%s): IP модема «%s» — не IPv4", i + 1, m->login, m->modem_ip);
             return i;
         }
-        if (m->listen_ip[0] && !ml_is_ipv4(m->listen_ip)) {
-            snprintf(err, errcap, "Строка %d (%s): Listen IP «%s» — не IPv4", i + 1, m->login, m->listen_ip);
-            return i;
-        }
-
         /* Cross-row collisions. Hand-entered ports make these a real risk, so
          * they are hard errors rather than something 3proxy discovers at bind. */
         for (j = 0; j < c->count; j++) {
@@ -188,18 +181,15 @@ static void modem_from_json(Modem *m, const JVal *o, int fallback_id)
     memset(m, 0, sizeof(*m));
     m->id = (int)json_num(o, "id", fallback_id);
     m->n  = (int)json_num(o, "n",  fallback_id);
-    ml_strlcpy(m->name,      json_str(o, "name",      ""),        sizeof(m->name));
     ml_strlcpy(m->login,     json_str(o, "login",     ""),        sizeof(m->login));
     ml_strlcpy(m->pass,      json_str(o, "pass",      ""),        sizeof(m->pass));
     ml_strlcpy(m->lan_ip,    json_str(o, "lan_ip",    ""),        sizeof(m->lan_ip));
     ml_strlcpy(m->modem_ip,  json_str(o, "modem_ip",  ""),        sizeof(m->modem_ip));
-    ml_strlcpy(m->listen_ip, json_str(o, "listen_ip", "0.0.0.0"), sizeof(m->listen_ip));
     m->proxy_port   = (int)json_num(o, "proxy_port",   0);
     m->reconn_port  = (int)json_num(o, "reconn_port",  0);
     m->interval_min = (int)json_num(o, "interval_min", 0);
     m->enabled      =      json_bool(o, "enabled",     1);
-    if (!m->name[0])  snprintf(m->name, sizeof(m->name), "modem%d", m->n);
-    if (!m->login[0]) ml_strlcpy(m->login, m->name, sizeof(m->login));
+    if (!m->login[0]) snprintf(m->login, sizeof(m->login), "modem%d", m->n);
 }
 
 /* One-time import of the Python panel's modems.conf ("N password [interval]").
@@ -231,7 +221,6 @@ static BOOL import_legacy(Config *c)
         m = &c->modems[idx];
 
         m->n = n;
-        snprintf(m->name,     sizeof(m->name),     "modem%d",       n);
         snprintf(m->login,    sizeof(m->login),    "modem%d",       n);
         snprintf(m->lan_ip,   sizeof(m->lan_ip),   "192.168.%d.100", n);
         snprintf(m->modem_ip, sizeof(m->modem_ip), "192.168.%d.1",   n);
@@ -326,12 +315,11 @@ BOOL cfg_save(const Config *c)
         jb_raw(&b, i ? ",\n    {" : "\n    {");
         jb_kv_int (&b, "id",           m->id);           jb_raw(&b, ", ");
         jb_kv_int (&b, "n",            m->n);            jb_raw(&b, ", ");
-        jb_kv_str (&b, "name",         m->name);         jb_raw(&b, ", ");
         jb_kv_str (&b, "login",        m->login);        jb_raw(&b, ", ");
         jb_kv_str (&b, "pass",         m->pass);         jb_raw(&b, ",\n     ");
         jb_kv_str (&b, "lan_ip",       m->lan_ip);       jb_raw(&b, ", ");
         jb_kv_str (&b, "modem_ip",     m->modem_ip);     jb_raw(&b, ", ");
-        jb_kv_str (&b, "listen_ip",    m->listen_ip);    jb_raw(&b, ",\n     ");
+        jb_raw(&b, "\n     ");
         jb_kv_int (&b, "proxy_port",   m->proxy_port);   jb_raw(&b, ", ");
         jb_kv_int (&b, "reconn_port",  m->reconn_port);  jb_raw(&b, ", ");
         jb_kv_int (&b, "interval_min", m->interval_min); jb_raw(&b, ", ");

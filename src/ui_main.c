@@ -48,7 +48,7 @@ enum {
 /* ------------------------------------------------------------- state */
 typedef struct {
     int  modem_id;
-    HWND en, name, login, pass, gen, port, lanip, modemip, rport, intv;
+    HWND en, num, login, pass, gen, port, lanip, modemip, rport, intv;
     HWND test, reconn, reboot, logbtn, del;
     BOOL enabled;
     int  test_state;              /* ML_TEST_* */
@@ -113,7 +113,11 @@ static void clipboard_put(const char *utf8)
 
 /* ------------------------------------------------------------- workers */
 typedef struct { int modem_id; char host[ML_ADDR_LEN]; char login[ML_LOGIN_LEN];
-                 char pass[ML_PASS_LEN]; int port; } TestJob;
+                 char pass[ML_PASS_LEN]; int port;
+                 /* Where to reach the proxy. NOT loopback: 3proxy binds -i to
+                  * the host's LAN address, so 127.0.0.1 would refuse the
+                  * connection and every test would read "нет ответа". */
+                 char proxy[ML_ADDR_LEN]; } TestJob;
 typedef struct { int modem_id; char text[96]; int state; } TestResult;
 typedef struct { int modem_id; char host[ML_ADDR_LEN]; char login[ML_LOGIN_LEN];
                  int reboot; } ActJob;
@@ -131,7 +135,7 @@ static DWORD WINAPI test_thread(LPVOID arg)
 
     /* Exit IP as seen from outside, fetched through this modem's own port —
      * this is the check that proves -e actually pinned the right interface. */
-    if (http_get_via_proxy("http://api.ipify.org", "127.0.0.1", j->port,
+    if (http_get_via_proxy("http://api.ipify.org", j->proxy, j->port,
                            j->login, j->pass, 9000, &r) && r.status == 200 && r.body) {
         char *p = r.body, *w = exit_ip;
         while (*p == ' ' || *p == '\n' || *p == '\r') p++;
@@ -144,7 +148,7 @@ static DWORD WINAPI test_thread(LPVOID arg)
     if (j->host[0]) {
         char url[ML_URL_LEN];
         snprintf(url, sizeof(url), "http://%s/api/webserver/SesTokInfo", j->host);
-        if (http_get_via_proxy(url, "127.0.0.1", j->port, j->login, j->pass, 8000, &r) &&
+        if (http_get_via_proxy(url, j->proxy, j->port, j->login, j->pass, 8000, &r) &&
             r.body && strstr(r.body, "SesInfo"))
             huawei = TRUE;
         http_free(&r);
@@ -233,7 +237,7 @@ static void row_load(HWND row, const Modem *m)
     if (!d) return;
     d->modem_id = m->id;
     d->enabled  = m->enabled;
-    edit_set(d->name,     m->name);
+    edit_set_int(d->num,  m->n);
     edit_set(d->login,    m->login);
     edit_set(d->pass,     m->pass);
     edit_set(d->lanip,    m->lan_ip);
@@ -248,7 +252,7 @@ static void row_store(HWND row, Modem *m)
 {
     RowData *d = row_data(row);
     if (!d) return;
-    edit_get(d->name,    m->name,     sizeof(m->name));
+    m->n = edit_get_int(d->num);
     edit_get(d->login,   m->login,    sizeof(m->login));
     edit_get(d->pass,    m->pass,     sizeof(m->pass));
     edit_get(d->lanip,   m->lan_ip,   sizeof(m->lan_ip));
@@ -257,7 +261,6 @@ static void row_store(HWND row, Modem *m)
     m->reconn_port  = edit_get_int(d->rport);
     m->interval_min = edit_get_int(d->intv);
     m->enabled      = d->enabled;
-    if (!m->listen_ip[0]) ml_strlcpy(m->listen_ip, "0.0.0.0", sizeof(m->listen_ip));
 }
 
 /* Height of a row in the current mode — the list needs it before laying out. */
@@ -283,16 +286,19 @@ static void row_layout(HWND row)
     if (g_mode == MODE_WIDE) {
         flex_reset(&L);
         flex_add(&L, d->en,      26,  0, 0);
-        flex_add(&L, d->name,    82,  1, 0);
+        flex_add(&L, d->num,     44,  0, 0);
+        flex_add(&L, d->modemip,108,  1, 0);
+        flex_add(&L, d->lanip,  108,  1, 0);
+        flex_add(&L, d->port,    58,  0, 0);
         flex_add(&L, d->login,   92,  1, 0);
         flex_add(&L, d->pass,   104,  1, 0);
         flex_add(&L, d->gen,     26,  0, 0);
-        flex_add(&L, d->port,    58,  0, 0);
-        flex_add(&L, d->lanip,  104,  1, 0);
-        flex_add(&L, d->modemip,104,  1, 0);
         flex_add(&L, d->rport,   58,  0, 0);
         flex_add(&L, d->intv,    46,  0, 0);
-        flex_add(&L, NULL,       86,  1, 0);      /* test result, painted */
+        /* Weight 2: the exit IP is what gets read after every reconnect, so
+         * spare width goes here first. A v4 address plus the Huawei marker
+         * needs ~150dp before it starts eliding. */
+        flex_add(&L, NULL,      150,  2, 0);
         flex_add(&L, d->test,    56,  0, 0);
         flex_add(&L, d->reconn,  26,  0, 0);
         flex_add(&L, d->reboot,  26,  0, 0);
@@ -302,20 +308,20 @@ static void row_layout(HWND row)
     } else if (g_mode == MODE_MID) {
         flex_reset(&L);
         flex_add(&L, d->en,      26,  0, 0);
-        flex_add(&L, d->name,    82,  1, 0);
-        flex_add(&L, d->login,   92,  1, 0);
-        flex_add(&L, d->pass,   104,  1, 0);
-        flex_add(&L, d->gen,     26,  0, 0);
+        flex_add(&L, d->num,     44,  0, 0);
+        flex_add(&L, d->modemip,108,  1, 0);
+        flex_add(&L, d->lanip,  108,  1, 0);
         flex_add(&L, d->port,    58,  0, 0);
-        flex_add(&L, d->intv,    46,  0, 0);
+        flex_add(&L, d->login,   92,  1, 0);
         y = flex_apply(&L, x, y, w, lh, ROW_GAP) + S(ROW_GAP);
 
         flex_reset(&L);
         flex_add(&L, NULL,       26,  0, 0);
-        flex_add(&L, d->lanip,  104,  1, 0);
-        flex_add(&L, d->modemip,104,  1, 0);
+        flex_add(&L, d->pass,   104,  1, 0);
+        flex_add(&L, d->gen,     26,  0, 0);
         flex_add(&L, d->rport,   58,  0, 0);
-        flex_add(&L, NULL,       70,  1, 0);      /* test result */
+        flex_add(&L, d->intv,    46,  0, 0);
+        flex_add(&L, NULL,      130,  2, 0);      /* test result */
         flex_add(&L, d->test,    56,  0, 0);
         flex_add(&L, d->reconn,  26,  0, 0);
         flex_add(&L, d->reboot,  26,  0, 0);
@@ -325,25 +331,25 @@ static void row_layout(HWND row)
     } else {
         flex_reset(&L);
         flex_add(&L, d->en,      26,  0, 0);
-        flex_add(&L, d->name,    80,  1, 0);
-        flex_add(&L, d->login,   90,  2, 0);
+        flex_add(&L, d->num,     44,  0, 0);
+        flex_add(&L, d->login,   90,  1, 0);
+        flex_add(&L, d->port,    58,  0, 0);
+        y = flex_apply(&L, x, y, w, lh, ROW_GAP) + S(ROW_GAP);
+
+        flex_reset(&L);
+        flex_add(&L, d->modemip, 96,  1, 0);
+        flex_add(&L, d->lanip,   96,  1, 0);
         y = flex_apply(&L, x, y, w, lh, ROW_GAP) + S(ROW_GAP);
 
         flex_reset(&L);
         flex_add(&L, d->pass,    96,  2, 0);
         flex_add(&L, d->gen,     26,  0, 0);
-        flex_add(&L, d->port,    54,  1, 0);
         flex_add(&L, d->rport,   54,  1, 0);
         flex_add(&L, d->intv,    44,  0, 0);
         y = flex_apply(&L, x, y, w, lh, ROW_GAP) + S(ROW_GAP);
 
         flex_reset(&L);
-        flex_add(&L, d->lanip,   96,  1, 0);
-        flex_add(&L, d->modemip, 96,  1, 0);
-        y = flex_apply(&L, x, y, w, lh, ROW_GAP) + S(ROW_GAP);
-
-        flex_reset(&L);
-        flex_add(&L, NULL,       60,  1, 0);      /* test result */
+        flex_add(&L, NULL,      120,  1, 0);      /* test result */
         flex_add(&L, d->test,    56,  0, 0);
         flex_add(&L, d->reconn,  26,  0, 0);
         flex_add(&L, d->reboot,  26,  0, 0);
@@ -370,7 +376,8 @@ static void row_paint_result(HWND row, HDC dc)
 
     /* the result sits immediately left of the Test button */
     cell.right = cell.left - S(ROW_GAP);
-    cell.left  = cell.right - S(g_mode == MODE_WIDE ? 86 : 70);
+    cell.left  = cell.right - S(g_mode == MODE_WIDE ? 150 :
+                                g_mode == MODE_MID  ? 130 : 120);
     if (cell.left < S(ROW_PAD)) cell.left = S(ROW_PAD);
     cell.top    = cell.top + (cell.bottom - cell.top - lh) / 2;
     cell.bottom = cell.top + lh;
@@ -399,7 +406,7 @@ static LRESULT CALLBACK RowProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (!nd) return -1;
         SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)nd);
         nd->en      = btn_create(h, L"\x2611", IDC_R_EN, BTN_ICON);
-        nd->name    = edit_create(h, IDC_R_NAME,    FALSE, FALSE);
+        nd->num     = edit_create(h, IDC_R_NAME,    TRUE,  FALSE);
         nd->login   = edit_create(h, IDC_R_LOGIN,   TRUE,  FALSE);
         nd->pass    = edit_create(h, IDC_R_PASS,    TRUE,  FALSE);
         nd->gen     = btn_create(h, L"\x21ba", IDC_R_GEN, BTN_ICON);
@@ -757,6 +764,9 @@ static void action_test(HWND row)
     ml_strlcpy(j->host,  m->modem_ip, sizeof(j->host));
     ml_strlcpy(j->login, m->login,    sizeof(j->login));
     ml_strlcpy(j->pass,  m->pass,     sizeof(j->pass));
+    /* Match whatever went into -i; empty means 3proxy bound every interface,
+     * and then loopback is reachable again. */
+    ml_strlcpy(j->proxy, g_cfg.lan_ip[0] ? g_cfg.lan_ip : "127.0.0.1", sizeof(j->proxy));
 
     d->test_state = ML_TEST_PENDING;
     ml_strlcpy(d->test_text, "...", sizeof(d->test_text));
@@ -939,11 +949,12 @@ static void paint_main(HWND h, HDC dc)
 
     /* --- column header (wide mode only) --- */
     if (g_mode == MODE_WIDE) {
-        static const wchar_t *H[] = { L"", L"ИМЯ", L"ЛОГИН", L"ПАРОЛЬ", L"", L"ПОРТ",
-                                      L"LAN IP (-e)", L"IP МОДЕМА", L"РЕК.ПОРТ", L"ИНТ",
+        /* Must mirror the WIDE flex line in row_layout() exactly. */
+        static const wchar_t *H[] = { L"", L"№", L"IP МОДЕМА", L"LAN IP (-e)", L"ПОРТ",
+                                      L"ЛОГИН", L"ПАРОЛЬ", L"", L"РЕК.ПОРТ", L"ИНТ",
                                       L"ТЕСТ", L"", L"", L"", L"", L"" };
-        static const int W[] = { 26, 82, 92, 104, 26, 58, 104, 104, 58, 46, 86, 56, 26, 26, 26, 26 };
-        static const int F[] = {  0,  1,  1,   1,  0,  0,   1,   1,  0,  0,  1,  0,  0,  0,  0,  0 };
+        static const int W[] = { 26, 44, 108, 108, 58, 92, 104, 26, 58, 46, 150, 56, 26, 26, 26, 26 };
+        static const int F[] = {  0,  0,   1,   1,  0,  1,   1,  0,  0,  0,   2,  0,  0,  0,  0,  0 };
         int i, total_min = 0, weight = 0, avail, leftover, cx;
 
         r = rc; r.top = y; r.bottom = y + S(COLHDR_H);
