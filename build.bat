@@ -59,7 +59,22 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo   compiling agent...
+REM Agent side: serves the modem web UI on a virtual address over SOCKS5.
+cl.exe /nologo /W3 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
+   /Isrc /Fobuild\a_ /Fdbuild\a_ ^
+   src\agent_main.c src\util.c src\json.c src\socks5.c src\mediator.c ^
+   /link /SUBSYSTEM:CONSOLE /OUT:build\modlink-agent.exe ^
+   ws2_32.lib advapi32.lib shell32.lib ole32.lib winhttp.lib user32.lib
+
+if errorlevel 1 (
+    echo.
+    echo   BUILD FAILED ^(agent^)
+    exit /b 1
+)
+
 echo.
 echo   OK: build\modlink.exe
+echo   OK: build\modlink-agent.exe
 echo   OK: build\tapprobe.exe
-dir /b build\modlink.exe build\tapprobe.exe
+dir /b build\*.exe
