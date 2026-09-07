@@ -1,146 +1,192 @@
-# modlink — server
+# modlink
 
-Exposes LTE modems as a managed HTTPS/SOCKS5 proxy pool.
+Панель управления пулом LTE-модемов под Windows. Каждый модем становится
+отдельным HTTP+SOCKS5 прокси на своём порту — со своим логином, паролем и
+кнопкой смены IP.
 
-Each modem N → dedicated port `BASE_PORT + N` → sing-box `mixed` inbound (handles both HTTP CONNECT and SOCKS5) → outbound bound to `192.168.N.100` (modem interface).  
-Huawei web-API (`192.168.N.1`) accessible transparently via HTTP CONNECT through the proxy.
-
----
-
-## Architecture
+Нативное приложение на C. Ни Python, ни браузера, ни установщика — один `.exe`.
 
 ```
-Client (Proxmox / proxyveth)
-    │ HTTPS proxy  →  IP:PORT:modemN:pass
-    ▼
-modlink server  (this repo)
-    sing-box  mixed inbound  (port BASE+N, TLS)
-    │
-    outbound  bind 192.168.N.100
-    │
-    LTE modem N  →  internet (mobile IP)
+Клиент ──HTTP/SOCKS5──▶ :ПОРТ ──▶ 3proxy (auto) ──▶ LAN IP модема ──▶ LTE ──▶ интернет
+                                                      │
+                             Huawei HiLink API ◀──────┘   реконнект · ребут · статус
 ```
 
 ---
 
-## Quick start — Linux
+## Скачать
+
+**Actions → последний зелёный запуск → артефакт `modlink-windows-x64`.**
+
+Компилятор не нужен: CI собирает `.exe` на каждый пуш. Внутри уже лежит
+3proxy — он распаковывается сам при первом запуске.
+
+---
+
+## Быстрый старт
+
+1. Запусти `modlink.exe`. При первом старте список пуст.
+2. **+ Добавить** — появится строка с автоматически предложенными портом,
+   паролем и адресами вида `192.168.N.x`.
+3. Поправь под свои модемы: **LAN IP** — адрес интерфейса модема на этом
+   хосте, **IP модема** — адрес его веб-морды.
+4. **Применить** — генерируется конфиг и стартует 3proxy.
+5. **Test** на строке — покажет внешний IP, полученный через этот модем.
+   Разные IP на разных строках означают, что привязка к интерфейсам работает.
+6. **Копировать** — положит в буфер строки `IP:PORT:LOGIN:PASS` и URL
+   реконнекта, готовые к раздаче клиентам.
+
+---
+
+## Поля таблицы
+
+| Поле | Что это | Куда уходит |
+|---|---|---|
+| ☑ | строка активна | выключенные пропускаются при генерации |
+| Имя | произвольная метка | только интерфейс |
+| Логин | имя пользователя прокси | `users <логин>:CL:<пароль>` |
+| Пароль | пароль прокси | там же; `↺` генерирует новый |
+| Порт | порт прокси | `auto -p<порт>` |
+| LAN IP (-e) | адрес интерфейса модема на хосте | `auto -e<ip>` — **именно это привязывает трафик к модему** |
+| IP модема | веб-интерфейс Huawei | HiLink API: реконнект, ребут, проверка |
+| Рек. порт | порт триггера реконнекта | `GET http://<ip>:<порт>/reconnect` |
+| Инт | автореконнект, минут (`0` — выкл) | таймер внутри приложения |
+
+Кнопки строки: **Test** — внешний IP через этот прокси плюс доступность
+HiLink; **⟳** — реконнект (смена IP); **↻** — ребут модема; **≡** — лог
+реконнектов; **✕** — удалить строку.
+
+---
+
+## Адаптивная вёрстка
+
+Ширина окна выбирает режим, строки перестраиваются сами:
+
+| Ширина | Режим | Строка модема |
+|---|---|---|
+| ≥ 1150 dp | широкий | одна линия + шапка колонок |
+| ≥ 880 dp | средний | две линии |
+| < 880 dp | карточка | четыре линии |
+
+Ширины полей раздаёт flex-распределитель (`flex_apply` в `src/ui_theme.c`):
+у каждой ячейки минимум и вес, остаток делится по весам. DPI учитывается,
+переезд на монитор с другим масштабом пересобирает шрифты по `WM_DPICHANGED`.
+
+---
+
+## Что генерируется для 3proxy
+
+```
+auth strong
+users "modem101:CL:te5xg83ted" "modem102:CL:v4yeyzh43n"
+
+flush
+allow modem101
+auto -p15000 -i0.0.0.0 -e192.168.101.100 -olSO_EXCLUSIVEADDRUSE
+
+flush
+allow modem102
+auto -p15002 -i0.0.0.0 -e192.168.102.100 -olSO_EXCLUSIVEADDRUSE
+```
+
+`auto` (появился в 3proxy 0.9.5) сам определяет, HTTP CONNECT это или SOCKS5 —
+**один порт на оба протокола**. `flush` перед каждым сервисом сбрасывает
+накопленный ACL, поэтому модем не может уйти через чужой интерфейс.
+
+3proxy запускается в Job Object с `KILL_ON_JOB_CLOSE` — умирает вместе с
+панелью гарантированно, даже если её прибить жёстко.
+
+---
+
+## Файлы на диске
+
+```
+%ProgramData%\modlink\
+  config.json                 настройки и список модемов
+  3proxy.cfg                  генерируется; править бесполезно, перезапишется
+  bin\3proxy.exe              распаковывается из ресурса при первом запуске
+  logs\
+    modlink.log               лог приложения
+    3proxy.log                лог прокси, ротация 7 дней
+    modem<id>_reconnect.txt   история реконнектов, ротация на 5 МБ
+```
+
+---
+
+## Устройство кода
+
+| Файл | Отвечает за |
+|---|---|
+| `src/main.c` | точка входа, single-instance |
+| `src/config.c` | `config.json`, валидация, коллизии портов |
+| `src/proxy3.c` | генерация `3proxy.cfg`, запуск и надзор за процессом |
+| `src/net.c` | HTTP-клиент на WinHTTP, определение внешнего IP |
+| `src/hilink.c` | Huawei HiLink: токены, реконнект, ребут |
+| `src/reconn.c` | слушатели `/reconnect` и таймеры автореконнекта |
+| `src/ui_main.c` | окно, адаптивная раскладка, фоновые операции |
+| `src/ui_theme.c` | тёмная тема, owner-draw контролы, flex |
+| `src/json.c` | минимальный JSON-парсер и сериализатор |
+| `src/util.c` | пути, логи, строки, атомарная запись файлов |
+
+Внешних зависимостей нет — только системные библиотеки Windows.
+
+---
+
+## Сборка
+
+Обычно не требуется — бери артефакт из Actions. Если всё же нужно локально:
+
+```bat
+build.bat
+```
+
+Нужны [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)
+с workload «Desktop development with C++». Скрипт сам скачает 3proxy при первом
+запуске и положит `modlink.exe` в `build\`.
+
+Проверить сборку с macOS или Linux (без запуска):
 
 ```bash
-# 1. Install sing-box
-bash <(curl -fsSL https://sing-box.app/installer.sh)
-
-# 2. Get scripts
-curl -fsSL https://raw.githubusercontent.com/Tovarish666/modlink/main/server.py \
-  -o /usr/local/bin/modlink-server && chmod +x /usr/local/bin/modlink-server
-curl -fsSL https://raw.githubusercontent.com/Tovarish666/modlink/main/panel.py \
-  -o /usr/local/bin/modlink-panel  && chmod +x /usr/local/bin/modlink-panel
-
-# 3. Create modem list  (/etc/modlink/modems.conf)
-mkdir -p /etc/modlink
-printf "1  pass1\n2  pass2\n" > /etc/modlink/modems.conf
-
-# 4. Apply
-modlink-server apply
-modlink-server status
-modlink-server test 1
-
-# 5. Web panel
-python3 /usr/local/bin/modlink-panel    # → http://localhost:5000
+ZIG=/path/to/zig ./build-zig.sh
 ```
+
+Кросс-компиляция через zig — ловит ошибки компиляции и линковки, но ресурсы
+этим путём не встраиваются и запустить результат нельзя.
 
 ---
 
-## Windows — native app
+## История
 
-The Windows side is now a standalone C application in [`windows/`](windows/):
-a single `.exe`, no Python, with 3proxy embedded in place of sing-box.
-See [windows/README.md](windows/README.md).
+До версии 2.0 это была связка из Python-панели и sing-box. Переписано на C
+целиком; Python-часть лежит в истории гита (`git log --diff-filter=D`).
 
-Grab a build from the **Actions** tab (artifact `modlink-windows-x64`) — no
-compiler needed.
+| | Было | Стало |
+|---|---|---|
+| Движок | sing-box, ~30 МБ | 3proxy `auto`, ~1.5 МБ, вшит в exe |
+| Логин | `modem{N}`, только чтение | редактируемый |
+| Порт | `БАЗА + индекс*2`, пересчитывался | редактируемый, хранится |
+| LAN IP | `192.168.{N}.100` хардкод | редактируемый |
+| IP модема | `192.168.{N}.1` хардкод | редактируемый |
+| Вёрстка | фиксированная таблица | три режима по ширине окна |
+| Конфиг | `modems.conf` | `config.json` |
+| Запуск | Python + браузер | один `.exe` |
 
-<details>
-<summary>Legacy PowerShell deploy (superseded, kept for reference)</summary>
+### Две мины, которые попутно обезврежены
 
-```powershell
-# Run as Administrator:
-Set-ExecutionPolicy Bypass -Scope Process
-irm https://raw.githubusercontent.com/Tovarish666/modlink/main/deploy-win.ps1 | iex
-```
+**Порты уезжали.** Порт считался как `base + i*2`, где `i` — индекс в списке,
+*отсортированном по N*. Добавление модема с меньшим N сдвигало порты всех
+остальных, и уже розданные клиентам строки `IP:PORT:LOGIN:PASS` молча
+переставали работать. Теперь порт — обычное сохранённое поле, ничто не
+пересчитывается само, а коллизии ловятся при «Применить».
 
-What the script does:
-1. Checks / installs Python 3
-2. Downloads `sing-box.exe` (latest release)
-3. Generates self-signed TLS cert (PowerShell PKI, no openssl required)
-4. Downloads `panel.py` and `server.py`
-5. Registers autostart via Task Scheduler (runs as SYSTEM at boot)
-6. Opens panel at `http://localhost:5000`
-
-Manage the service:
-```powershell
-Start-ScheduledTask -TaskName "modlink-panel"
-Stop-ScheduledTask  -TaskName "modlink-panel"
-Get-ScheduledTask   -TaskName "modlink-panel" | Select TaskName, State
-```
-
-</details>
----
-
-## modems.conf format
-
-```
-# /etc/modlink/modems.conf      (Linux)
-# %ProgramData%\modlink\modems.conf  (Windows)
-#
-# N  password
-# N = modem number = third octet of 192.168.N.x
-1   abc123def4
-2   xyz987mnpq
-```
-
-Passwords are auto-generated if omitted.
+**«TLS ON» был фикцией.** sing-box не поддерживает TLS на `mixed` inbound — это
+признано прямо в комментарии того кода, — но панель рисовала зелёный значок, а
+вся машинерия генерации сертификата производила файл, который никто никогда не
+читал. Значок и сертификаты убраны.
 
 ---
 
-## Web panel features
+## Лицензии
 
-- **External IP** — auto-detect or set manually (shown in copy output)  
-- **Base port** — configurable (default 10000), modem N → port `BASE + N`  
-- **⟳ Auto** — fetches public IP from api.ipify.org  
-- **↺** — regenerate password per modem  
-- **▶ Test** — checks exit IP + Huawei `.1` API via proxy  
-- **⎘ Copy** — copies `IP:PORT:modemN:pass` lines (ready for client `modems.conf`)  
-- **Apply** — saves config + restarts sing-box  
-
----
-
-## Proxy credentials format
-
-```
-IP:PORT:LOGIN:PASS
-
-Example (modem 1, base port 10000):
-  1.2.3.4:10001:modem1:abc123def4
-
-Protocol: HTTP CONNECT + SOCKS5 (mixed, on the same port)
-TLS: yes (self-signed cert, use --proxy-insecure or add cert to trust store)
-```
-
----
-
-## Port layout
-
-| Modem | Port      | Protocol       |
-|-------|-----------|----------------|
-| 1     | BASE+1    | HTTP + SOCKS5  |
-| 2     | BASE+2    | HTTP + SOCKS5  |
-| N     | BASE+N    | HTTP + SOCKS5  |
-
-Default BASE = 10000. One port per modem, both protocols.
-
----
-
-## Huawei gateway emulation
-
-The remote server has L2 access to `192.168.N.1` (Huawei router web-API).  
-A client doing `CONNECT 192.168.N.1:80` through the proxy gets forwarded to the real device — same address, same API, no VPN.
+Вшит `3proxy.exe` — BSD-подобная лицензия, бинарная редистрибуция разрешена
+при сохранении копирайта, см. [THIRD-PARTY.txt](THIRD-PARTY.txt).

@@ -13,12 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set working directory
-        run: echo "the C project lives in windows/"
-
       - name: Fetch 3proxy
         shell: pwsh
-        working-directory: windows
         run: ./tools/fetch-3proxy.ps1 -Version 1.0.0 -Arch x64
 
       - uses: ilammy/msvc-dev-cmd@v1
@@ -27,20 +23,19 @@ jobs:
 
       - name: Build
         shell: cmd
-        working-directory: windows
         run: build.bat
 
       - name: Stage artifact
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item windows\build\modlink.exe dist\
-          Copy-Item windows\THIRD-PARTY.txt   dist\
-          Copy-Item windows\README.md         dist\
-          Copy-Item windows\res\3proxy.version.txt dist\ -ErrorAction SilentlyContinue
+          Copy-Item build/modlink.exe        dist/
+          Copy-Item THIRD-PARTY.txt          dist/
+          Copy-Item README.md                dist/
+          Copy-Item res/3proxy.version.txt   dist/ -ErrorAction SilentlyContinue
 
-      # This is the whole point of the CI: download modlink.exe from here,
-      # no compiler needed on your machine.
+      # The point of this workflow: download modlink.exe from here, so no
+      # compiler is ever needed on a development machine.
       - uses: actions/upload-artifact@v4
         with:
           name: modlink-windows-x64
