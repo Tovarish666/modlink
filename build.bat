@@ -65,10 +65,16 @@ REM Agent side: serves the modem web UI on a virtual address over SOCKS5.
 REM Objects go to their own directory: /Fo without a trailing backslash is read
 REM as a single output filename, which MSVC rejects for multiple sources.
 if not exist build\agent mkdir build\agent
+REM /W3 для нашего кода; lwIP собирается с /W1 — он чистый по своим меркам,
+REM но сыплет замечаниями MSVC, которые чинить в чужом коде мы не будем.
 cl.exe /nologo /W3 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
    /D_WINSOCK_DEPRECATED_NO_WARNINGS ^
-   /Isrc /Fobuild\agent\ /Fdbuild\agent\ ^
+   /Isrc /Isrc\lwip_port /Ithird_party\lwip\src\include ^
+   /Fobuild\agent\ /Fdbuild\agent\ ^
    src\agent_main.c src\util.c src\json.c src\socks5.c src\mediator.c ^
+   third_party\lwip\src\core\*.c ^
+   third_party\lwip\src\core\ipv4\*.c ^
+   third_party\lwip\src\netif\ethernet.c ^
    /link /SUBSYSTEM:CONSOLE /OUT:build\modlink-agent.exe ^
    ws2_32.lib advapi32.lib shell32.lib ole32.lib winhttp.lib user32.lib
 
