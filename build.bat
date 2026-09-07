@@ -47,6 +47,19 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo   compiling tapprobe...
+REM Diagnostic probe for the agent side; console subsystem, no resources.
+cl.exe /nologo /W3 /O2 /MT /utf-8 /D_CRT_SECURE_NO_WARNINGS ^
+   /Fobuild\ /Fdbuild\ probe\tapprobe.c ^
+   /link /SUBSYSTEM:CONSOLE /OUT:build\tapprobe.exe advapi32.lib
+
+if errorlevel 1 (
+    echo.
+    echo   BUILD FAILED ^(tapprobe^)
+    exit /b 1
+)
+
 echo.
 echo   OK: build\modlink.exe
-dir /b build\modlink.exe
+echo   OK: build\tapprobe.exe
+dir /b build\modlink.exe build\tapprobe.exe
