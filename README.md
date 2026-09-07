@@ -50,7 +50,17 @@ python3 /usr/local/bin/modlink-panel    # → http://localhost:5000
 
 ---
 
-## Quick start — Windows 10 (temporary)
+## Windows — native app
+
+The Windows side is now a standalone C application in [`windows/`](windows/):
+a single `.exe`, no Python, with 3proxy embedded in place of sing-box.
+See [windows/README.md](windows/README.md).
+
+Grab a build from the **Actions** tab (artifact `modlink-windows-x64`) — no
+compiler needed.
+
+<details>
+<summary>Legacy PowerShell deploy (superseded, kept for reference)</summary>
 
 ```powershell
 # Run as Administrator:
@@ -73,6 +83,7 @@ Stop-ScheduledTask  -TaskName "modlink-panel"
 Get-ScheduledTask   -TaskName "modlink-panel" | Select TaskName, State
 ```
 
+</details>
 ---
 
 ## modems.conf format

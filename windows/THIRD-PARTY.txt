@@ -1,0 +1,42 @@
+modlink bundles the following third-party component.
+
+================================================================================
+3proxy — https://github.com/3proxy/3proxy
+Version 1.0.0, redistributed as an unmodified binary embedded in modlink.exe
+and extracted to %ProgramData%\modlink\bin\3proxy.exe at runtime.
+
+3proxy Public License Agreement
+
+(c) 2000-2025 by 3APA3A (3APA3A@3proxy.ru)
+(c) 2000-2025 by 3proxy.org (https://3proxy.org/)
+(c) 2000-2025 by Vladimir Dubrovin (vlad@3proxy.org)
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+This software is FREEWARE.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that following conditions
+are met (BSD style license):
+
+    * Redistributions of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+    * Neither the name of the SecurityVulns.COM nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+
+Full text: https://github.com/3proxy/3proxy/blob/master/copying
+================================================================================
