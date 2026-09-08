@@ -72,7 +72,7 @@ cl.exe /nologo /W3 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS
    /Isrc /Isrc\lwip_port /Ithird_party\lwip\src\include ^
    /Fobuild\agent\ /Fdbuild\agent\ ^
    src\agent_main.c src\util.c src\json.c src\socks5.c src\mediator.c ^
-   src\tap.c src\lwip_port\sys_arch.c ^
+   src\tap.c src\tunnel.c src\lwip_port\sys_arch.c ^
    third_party\lwip\src\core\*.c ^
    third_party\lwip\src\core\ipv4\*.c ^
    third_party\lwip\src\netif\ethernet.c ^
