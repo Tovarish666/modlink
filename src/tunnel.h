@@ -16,6 +16,7 @@
 typedef struct {
     char guid[TAP_GUID_LEN];      /* какой TAP-адаптер занимать */
     char virt_ip [ML_ADDR_LEN];   /* адрес netif — он же шлюз с точки зрения клиента */
+    char real_ip [ML_ADDR_LEN];   /* настоящая веб-морда модема; пусто — не обслуживать */
     char netmask [ML_ADDR_LEN];
     char proxy_ip[ML_ADDR_LEN];
     int  proxy_port;

@@ -5,6 +5,8 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "httprw.h"
+
 #include "lwip/init.h"
 #include "lwip/netif.h"
 #include "lwip/tcp.h"
@@ -15,6 +17,10 @@
 #define MAX_CONNS     256
 #define BUF_SIZE      (64 * 1024)
 #define LOOP_TICK_MS  50
+
+/* Диагностика: где именно умерло соединение. Причина важнее факта — без неё
+ * "не работает" неотличимо от "прокси отказал" и "клиент отвалился". */
+#define DIE(c, why) do { ml_log("tunnel: conn dead (%s) st=%d", (why), (int)(c)->st);                          (c)->st = CS_DEAD; } while (0)
 
 /* --------------------------------------------------------------- состояние */
 typedef enum {
@@ -42,6 +48,13 @@ typedef struct {
 
     BOOL  client_closed;        /* клиент прислал FIN */
     BOOL  want_write;           /* есть что отправить наружу */
+
+    /* Соединение к самому 192.168.N.1 — это веб-морда модема, а не транзит.
+     * Тогда правим Host в запросе и Location в ответе, иначе прошивка ответит
+     * редиректом вместо данных и уведёт браузер на свой настоящий адрес. */
+    BOOL  mediated;
+    BOOL  req_fixed;            /* заголовки запроса уже поправлены */
+    BOOL  resp_fixed;           /* заголовки ответа уже поправлены */
 } Conn;
 
 static Conn            g_conns[MAX_CONNS];
@@ -52,6 +65,7 @@ static HANDLE          g_stop_ev = NULL;
 static volatile LONG   g_stop = 0;
 static TunnelCfg       g_cfg;
 static struct tcp_pcb *g_listener = NULL;
+static ip4_addr_t      g_netif_ip;
 
 static int                 g_active = 0, g_total = 0;
 static unsigned long long  g_bytes_up = 0, g_bytes_dn = 0;
@@ -86,7 +100,10 @@ static void conn_kill(Conn *c)
         tcp_recv(c->pcb, NULL);
         tcp_sent(c->pcb, NULL);
         tcp_err(c->pcb, NULL);
-        tcp_abort(c->pcb);
+        /* Закрываем по-человечески: клиент должен увидеть FIN, а не RST, иначе
+         * HTTP-клиент сочтёт уже полученный ответ оборванным. tcp_abort — только
+         * если закрыть не удалось (нет памяти под сегмент). */
+        if (tcp_close(c->pcb) != ERR_OK) tcp_abort(c->pcb);
         c->pcb = NULL;
     }
     if (c->sock != INVALID_SOCKET) { closesocket(c->sock); c->sock = INVALID_SOCKET; }
@@ -171,6 +188,14 @@ static err_t lw_accept(void *arg, struct tcp_pcb *pcb, err_t err)
     c->pcb = pcb;
     c->st  = CS_CONNECTING;
 
+    /* Клиент постучался на адрес самого интерфейса — значит ему нужна морда
+     * модема. Подменяем адресата на настоящий и включаем правку заголовков.
+     * Отдельный сокет для этого не нужен: слушатель-ловушка и так поймал всё. */
+    if (g_cfg.real_ip[0] && c->dst_ip.addr == g_netif_ip.addr && c->dst_port == 80) {
+        ip4addr_aton(g_cfg.real_ip, &c->dst_ip);
+        c->mediated = TRUE;
+    }
+
     tcp_arg(pcb, c);
     tcp_recv(pcb, lw_recv);
     tcp_sent(pcb, lw_sent);
@@ -242,31 +267,31 @@ static void socks_on_readable(Conn *c)
     switch (c->st) {
     case CS_GREET:
         n = recv(c->sock, (char *)b, 2, 0);
-        if (n != 2 || b[0] != 0x05) { c->st = CS_DEAD; return; }
+        if (n != 2 || b[0] != 0x05) { DIE(c,"greet: плохой ответ"); return; }
         if (b[1] == 0x02)      socks_send_auth(c);
         else if (b[1] == 0x00) socks_send_request(c);
-        else                   c->st = CS_DEAD;
+        else                   DIE(c,"greet: метод не поддержан");
         return;
 
     case CS_AUTH:
         n = recv(c->sock, (char *)b, 2, 0);
-        if (n != 2 || b[1] != 0x00) { c->st = CS_DEAD; return; }
+        if (n != 2 || b[1] != 0x00) { DIE(c,"auth: отказ"); return; }
         socks_send_request(c);
         return;
 
     case CS_REQUEST: {
         int need;
         n = recv(c->sock, (char *)b, 4, 0);
-        if (n != 4 || b[0] != 0x05) { c->st = CS_DEAD; return; }
-        if (b[1] != 0x00) { c->st = CS_DEAD; return; }   /* прокси отказал */
+        if (n != 4 || b[0] != 0x05) { DIE(c,"request: испорчен"); return; }
+        if (b[1] != 0x00) { ml_log("tunnel: proxy REP=0x%02X", b[1]); DIE(c,"request: прокси отказал"); return; }
         /* Дочитываем адрес из ответа: он не нужен, но оставить его в потоке
          * нельзя — он бы уехал клиенту как полезные данные. */
         need = (b[3] == 0x01) ? 6 : (b[3] == 0x04) ? 18 : -1;
         if (need < 0) {
-            if (recv(c->sock, (char *)b, 1, 0) != 1) { c->st = CS_DEAD; return; }
+            if (recv(c->sock, (char *)b, 1, 0) != 1) { DIE(c,"request: адрес обрезан"); return; }
             need = b[0] + 2;
         }
-        if (recv(c->sock, (char *)b, need, 0) != need) { c->st = CS_DEAD; return; }
+        if (recv(c->sock, (char *)b, need, 0) != need) { DIE(c,"request: адрес не дочитан"); return; }
         c->st = CS_OPEN;
         return;
     }
@@ -276,7 +301,7 @@ static void socks_on_readable(Conn *c)
         if (room <= 0) return;                 /* клиент не успевает — не читаем */
         n = recv(c->sock, c->dn + c->dn_len, room, 0);
         if (n > 0)      { c->dn_len += n; g_bytes_dn += (unsigned long long)n; }
-        else if (n == 0) c->st = CS_DEAD;      /* прокси закрыл */
+        else if (n == 0) DIE(c,"прокси закрыл");
         return;
     }
 
@@ -289,7 +314,20 @@ static void socks_on_readable(Conn *c)
 static void drain_up(Conn *c)          /* клиент → прокси */
 {
     int n;
-    if (c->st != CS_OPEN || c->up_len == 0) return;
+    if (c->st != CS_OPEN || c->up_len == 0 || c->sock == INVALID_SOCKET) return;
+
+    if (c->mediated && !c->req_fixed) {
+        /* Ждём заголовки целиком: Host правится до того, как уйдёт хоть байт. */
+        if (hrw_headers_end(c->up, c->up_len) < 0) {
+            if (c->up_len < BUF_SIZE) return;      /* ещё придёт */
+            c->req_fixed = TRUE;                   /* заголовки безумного размера — шлём как есть */
+        } else {
+            c->up_len = hrw_rewrite_header(c->up, c->up_len, BUF_SIZE,
+                                           "Host:", g_cfg.virt_ip, g_cfg.real_ip);
+            c->up_len = hrw_force_close(c->up, c->up_len, BUF_SIZE);
+            c->req_fixed = TRUE;
+        }
+    }
     n = send(c->sock, c->up, c->up_len, 0);
     if (n > 0) {
         memmove(c->up, c->up + n, (size_t)(c->up_len - n));
@@ -309,6 +347,17 @@ static void drain_down(Conn *c)        /* прокси → клиент */
 {
     int can, n;
     if (!c->pcb || c->dn_len == 0) return;
+
+    if (c->mediated && !c->resp_fixed) {
+        if (hrw_headers_end(c->dn, c->dn_len) < 0) {
+            if (c->dn_len < BUF_SIZE) return;
+            c->resp_fixed = TRUE;
+        } else {
+            c->dn_len = hrw_rewrite_header(c->dn, c->dn_len, BUF_SIZE,
+                                           "Location:", g_cfg.real_ip, g_cfg.virt_ip);
+            c->resp_fixed = TRUE;
+        }
+    }
     can = tcp_sndbuf(c->pcb);
     if (can <= 0) return;
     n = c->dn_len < can ? c->dn_len : can;
@@ -361,10 +410,14 @@ static void pump_all(void)
     for (i = 0; i < MAX_CONNS; i++) {
         Conn *c = &g_conns[i];
         if (c->st == CS_FREE) continue;
-        if (c->st == CS_DEAD) { conn_kill(c); continue; }
+
+        /* Порядок здесь принципиален. Прокси закрывает соединение сразу вслед
+         * за ответом — мы сами просим Connection: close, — поэтому CS_DEAD
+         * почти всегда наступает, когда ответ уже лежит в буфере. Убить
+         * соединение раньше, чем оно отдано клиенту, значит потерять ответ
+         * целиком: транзит этого не замечал, а короткий запрос-ответ ломался. */
         drain_up(c);
         drain_down(c);
-        /* Прокси закрылся, остатки отданы — закрываем и клиента. */
         if (c->st == CS_DEAD && c->dn_len == 0) conn_kill(c);
     }
 }
@@ -379,7 +432,7 @@ static void handle_socket_events(void)
         if (WSAEnumNetworkEvents(c->sock, c->ev, &ne) != 0) continue;
 
         if (ne.lNetworkEvents & FD_CONNECT) {
-            if (ne.iErrorCode[FD_CONNECT_BIT] != 0) { c->st = CS_DEAD; continue; }
+            if (ne.iErrorCode[FD_CONNECT_BIT] != 0) { ml_log("tunnel: connect к прокси не удался (%d)", ne.iErrorCode[FD_CONNECT_BIT]); c->st = CS_DEAD; continue; }
             socks_send_greeting(c);
         }
         if (ne.lNetworkEvents & FD_READ)  socks_on_readable(c);
@@ -436,6 +489,7 @@ BOOL tunnel_start(const TunnelCfg *cfg, char *err, size_t errcap)
     lwip_init();
 
     ip4addr_aton(g_cfg.virt_ip, &ip);
+    g_netif_ip = ip;
     ip4addr_aton(g_cfg.netmask[0] ? g_cfg.netmask : "255.255.255.0", &mask);
     ip4_addr_set_zero(&gw);
 

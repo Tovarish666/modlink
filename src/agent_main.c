@@ -129,6 +129,7 @@ int main(int argc, char **argv)
         ml_strlcpy(tcfg.guid,     tap_guid,      sizeof(tcfg.guid));
         ml_strlcpy(tcfg.virt_ip,  cfg.virt_ip,   sizeof(tcfg.virt_ip));
         ml_strlcpy(tcfg.netmask,  tap_mask,      sizeof(tcfg.netmask));
+        ml_strlcpy(tcfg.real_ip,  cfg.real_ip,   sizeof(tcfg.real_ip));
         ml_strlcpy(tcfg.proxy_ip, cfg.proxy_ip,  sizeof(tcfg.proxy_ip));
         ml_strlcpy(tcfg.user,     cfg.user,      sizeof(tcfg.user));
         ml_strlcpy(tcfg.pass,     cfg.pass,      sizeof(tcfg.pass));
@@ -142,7 +143,9 @@ int main(int argc, char **argv)
         printf("  туннель поднят на адаптере %s\n", tap_guid);
     }
 
-    if (cfg.real_ip[0] && !mediator_start(&cfg, err, sizeof(err))) {
+    /* При включённом туннеле морду обслуживает он сам — отдельный сокет на
+     * 192.168.N.1 занять всё равно нельзя, адрес принадлежит lwIP. */
+    if (cfg.real_ip[0] && !tunnel_on && !mediator_start(&cfg, err, sizeof(err))) {
         fprintf(stderr, "\n  ОШИБКА: %s\n", err);
         if (tunnel_on) tunnel_stop();
         WSACleanup();
@@ -165,7 +168,7 @@ int main(int argc, char **argv)
     }
 
     printf("\n  останавливаюсь...\n");
-    if (cfg.real_ip[0]) mediator_stop();
+    if (cfg.real_ip[0] && !tunnel_on) mediator_stop();
     if (tunnel_on) tunnel_stop();
     WSACleanup();
     return 0;
