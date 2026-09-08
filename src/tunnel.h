@@ -22,6 +22,7 @@ typedef struct {
     int  proxy_port;
     char user[ML_LOGIN_LEN];
     char pass[ML_PASS_LEN];
+    char dns_ip[ML_ADDR_LEN];     /* резолвер; пусто — 1.1.1.1 */
 } TunnelCfg;
 
 BOOL tunnel_start(const TunnelCfg *cfg, char *err, size_t errcap);

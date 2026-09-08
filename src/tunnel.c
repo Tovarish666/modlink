@@ -10,13 +10,20 @@
 #include "lwip/init.h"
 #include "lwip/netif.h"
 #include "lwip/tcp.h"
+#include "lwip/udp.h"
 #include "lwip/timeouts.h"
 #include "lwip/etharp.h"
 #include "netif/ethernet.h"
 
 #define MAX_CONNS     256
 #define BUF_SIZE      (64 * 1024)
-#define LOOP_TICK_MS  50
+/* Тик петли. Каждый шаг рукопожатия SOCKS5 ждёт следующей итерации, поэтому
+ * крупный тик прямо умножается на число шагов: при 50 мс один DNS-запрос
+ * терял четверть секунды на ровном месте. 5 мс — компромисс между задержкой и
+ * холостыми пробуждениями; правильное решение — ждать сразу и кадр, и события
+ * сокетов через WaitForMultipleObjects, но это требует разбить tap_read на
+ * начало и завершение операции. */
+#define LOOP_TICK_MS  5
 
 /* Диагностика: где именно умерло соединение. Причина важнее факта — без неё
  * "не работает" неотличимо от "прокси отказал" и "клиент отвалился". */
@@ -55,6 +62,11 @@ typedef struct {
     BOOL  mediated;
     BOOL  req_fixed;            /* заголовки запроса уже поправлены */
     BOOL  resp_fixed;           /* заголовки ответа уже поправлены */
+
+    /* Ответы SOCKS5 крошечные, но TCP не обязан отдавать их одним куском.
+     * Копим, пока не наберётся нужное, иначе на канале с джиттером соединение
+     * изредка умирает на ровном месте — и выглядит это как «иногда не works». */
+    unsigned char hs[300]; int hslen;
 } Conn;
 
 static Conn            g_conns[MAX_CONNS];
@@ -66,6 +78,28 @@ static volatile LONG   g_stop = 0;
 static TunnelCfg       g_cfg;
 static struct tcp_pcb *g_listener = NULL;
 static ip4_addr_t      g_netif_ip;
+
+/* ------------------------------------------------------------ DNS
+ * Запросы уводим по TCP через тот же прокси. Пустить UDP мимо туннеля нельзя:
+ * имена тогда резолвятся с адреса датацентра, а не модема — это и утечка, и
+ * расхождение геолокации между DNS и выходным адресом. */
+#define MAX_DNSQ   64
+#define DNS_TTL_MS 8000
+
+typedef struct {
+    BOOL      used;
+    SOCKET    sock;
+    WSAEVENT  ev;
+    ConnState st;
+    unsigned char hs[300]; int hslen;     /* накопитель ответов SOCKS5 */
+    char      q[1024]; int qlen, qsent;   /* запрос с 2-байтовым префиксом длины */
+    char      r[2048]; int rlen;          /* ответ, тоже с префиксом */
+    ip_addr_t from; u16_t fromport;       /* кому вернуть */
+    DWORD     started;
+} DnsQ;
+
+static DnsQ            g_dns[MAX_DNSQ];
+static struct udp_pcb *g_udp = NULL;
 
 static int                 g_active = 0, g_total = 0;
 static unsigned long long  g_bytes_up = 0, g_bytes_dn = 0;
@@ -116,6 +150,23 @@ static BOOL sock_send_all(Conn *c, const void *buf, int len)
 {
     int sent = send(c->sock, (const char *)buf, len, 0);
     return sent == len;
+}
+
+/* Копит из сокета, пока не наберётся `need` байт. TRUE — набралось.
+ * FALSE без ошибки означает «ещё придёт», ошибку сообщает *dead. */
+static BOOL hs_fill(SOCKET s, unsigned char *buf, int *len, int need, BOOL *dead)
+{
+    int n;
+    *dead = FALSE;
+    while (*len < need) {
+        n = recv(s, (char *)buf + *len, need - *len, 0);
+        if (n > 0) { *len += n; continue; }
+        if (n == 0) { *dead = TRUE; return FALSE; }
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return FALSE;
+        *dead = TRUE;
+        return FALSE;
+    }
+    return TRUE;
 }
 
 /* --------------------------------------------------------------- lwIP → нам */
@@ -261,37 +312,59 @@ static void socks_send_request(Conn *c)
  * убеждается, что пришло достаточно байт, и только потом двигает автомат. */
 static void socks_on_readable(Conn *c)
 {
-    unsigned char b[262];
+    BOOL dead;
     int n;
 
     switch (c->st) {
     case CS_GREET:
-        n = recv(c->sock, (char *)b, 2, 0);
-        if (n != 2 || b[0] != 0x05) { DIE(c,"greet: плохой ответ"); return; }
-        if (b[1] == 0x02)      socks_send_auth(c);
-        else if (b[1] == 0x00) socks_send_request(c);
-        else                   DIE(c,"greet: метод не поддержан");
+        if (!hs_fill(c->sock, c->hs, &c->hslen, 2, &dead)) {
+            if (dead) DIE(c, "greet: соединение оборвано");
+            return;
+        }
+        if (c->hs[0] != 0x05) { DIE(c, "greet: не SOCKS5"); return; }
+        { unsigned char m = c->hs[1]; c->hslen = 0;
+          if      (m == 0x02) socks_send_auth(c);
+          else if (m == 0x00) socks_send_request(c);
+          else                DIE(c, "greet: метод не поддержан"); }
         return;
 
     case CS_AUTH:
-        n = recv(c->sock, (char *)b, 2, 0);
-        if (n != 2 || b[1] != 0x00) { DIE(c,"auth: отказ"); return; }
+        if (!hs_fill(c->sock, c->hs, &c->hslen, 2, &dead)) {
+            if (dead) DIE(c, "auth: соединение оборвано");
+            return;
+        }
+        if (c->hs[1] != 0x00) { DIE(c, "auth: отказ"); return; }
+        c->hslen = 0;
         socks_send_request(c);
         return;
 
     case CS_REQUEST: {
         int need;
-        n = recv(c->sock, (char *)b, 4, 0);
-        if (n != 4 || b[0] != 0x05) { DIE(c,"request: испорчен"); return; }
-        if (b[1] != 0x00) { ml_log("tunnel: proxy REP=0x%02X", b[1]); DIE(c,"request: прокси отказал"); return; }
-        /* Дочитываем адрес из ответа: он не нужен, но оставить его в потоке
-         * нельзя — он бы уехал клиенту как полезные данные. */
-        need = (b[3] == 0x01) ? 6 : (b[3] == 0x04) ? 18 : -1;
-        if (need < 0) {
-            if (recv(c->sock, (char *)b, 1, 0) != 1) { DIE(c,"request: адрес обрезан"); return; }
-            need = b[0] + 2;
+        if (!hs_fill(c->sock, c->hs, &c->hslen, 4, &dead)) {
+            if (dead) DIE(c, "request: соединение оборвано");
+            return;
         }
-        if (recv(c->sock, (char *)b, need, 0) != need) { DIE(c,"request: адрес не дочитан"); return; }
+        if (c->hs[0] != 0x05) { DIE(c, "request: испорчен"); return; }
+        if (c->hs[1] != 0x00) {
+            ml_log("tunnel: proxy REP=0x%02X", c->hs[1]);
+            DIE(c, "request: прокси отказал");
+            return;
+        }
+        /* Адрес из ответа не нужен, но вычитать его обязательно — иначе он
+         * уедет клиенту как полезные данные. */
+        need = (c->hs[3] == 0x01) ? 4 + 4 + 2 : (c->hs[3] == 0x04) ? 4 + 16 + 2 : -1;
+        if (need < 0) {
+            if (!hs_fill(c->sock, c->hs, &c->hslen, 5, &dead)) {
+                if (dead) DIE(c, "request: домен обрезан");
+                return;
+            }
+            need = 4 + 1 + c->hs[4] + 2;
+        }
+        if (!hs_fill(c->sock, c->hs, &c->hslen, need, &dead)) {
+            if (dead) DIE(c, "request: адрес не дочитан");
+            return;
+        }
+        c->hslen = 0;
         c->st = CS_OPEN;
         return;
     }
@@ -365,6 +438,169 @@ static void drain_down(Conn *c)        /* прокси → клиент */
     tcp_output(c->pcb);
     memmove(c->dn, c->dn + n, (size_t)(c->dn_len - n));
     c->dn_len -= n;
+}
+
+/* --------------------------------------------------------------- DNS */
+static void dnsq_free(DnsQ *d)
+{
+    if (!d->used) return;
+    if (d->sock != INVALID_SOCKET) { closesocket(d->sock); d->sock = INVALID_SOCKET; }
+    if (d->ev) { WSACloseEvent(d->ev); d->ev = 0; }
+    d->used = FALSE;
+}
+
+static void dns_on_query(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                         const ip_addr_t *addr, u16_t port)
+{
+    DnsQ *d = NULL;
+    struct sockaddr_in a;
+    int i;
+    (void)arg; (void)pcb;
+
+    if (!p) return;
+    if (p->tot_len == 0 || p->tot_len > (u16_t)(sizeof(d->q) - 2)) { pbuf_free(p); return; }
+
+    for (i = 0; i < MAX_DNSQ; i++) if (!g_dns[i].used) { d = &g_dns[i]; break; }
+    if (!d) { pbuf_free(p); return; }
+
+    memset(d, 0, sizeof(*d));
+    d->used = TRUE;
+    d->sock = INVALID_SOCKET;
+    d->started = GetTickCount();
+    ip_addr_copy(d->from, *addr);
+    d->fromport = port;
+
+    /* DNS поверх TCP отличается от UDP только двухбайтовым префиксом длины. */
+    d->q[0] = (char)((p->tot_len >> 8) & 0xFF);
+    d->q[1] = (char)(p->tot_len & 0xFF);
+    pbuf_copy_partial(p, d->q + 2, p->tot_len, 0);
+    d->qlen = p->tot_len + 2;
+    pbuf_free(p);
+
+    d->sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (d->sock == INVALID_SOCKET) { dnsq_free(d); return; }
+    d->ev = WSACreateEvent();
+    if (!d->ev) { dnsq_free(d); return; }
+    WSAEventSelect(d->sock, d->ev, FD_CONNECT | FD_READ | FD_WRITE | FD_CLOSE);
+
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port   = htons((u_short)g_cfg.proxy_port);
+    a.sin_addr.s_addr = inet_addr(g_cfg.proxy_ip);
+    if (connect(d->sock, (struct sockaddr *)&a, sizeof(a)) != 0 &&
+        WSAGetLastError() != WSAEWOULDBLOCK) { dnsq_free(d); return; }
+    d->st = CS_CONNECTING;
+}
+
+static void dns_send_greeting(DnsQ *d)
+{
+    unsigned char b[4]; int n = 0;
+    b[n++] = 0x05;
+    if (g_cfg.user[0]) { b[n++] = 2; b[n++] = 0x00; b[n++] = 0x02; }
+    else               { b[n++] = 1; b[n++] = 0x00; }
+    if (send(d->sock, (char *)b, n, 0) != n) { dnsq_free(d); return; }
+    d->st = CS_GREET;
+}
+
+static void dns_send_request(DnsQ *d)
+{
+    unsigned char b[16]; int n = 0;
+    ip4_addr_t r;
+    ip4addr_aton(g_cfg.dns_ip[0] ? g_cfg.dns_ip : "1.1.1.1", &r);
+    b[n++] = 0x05; b[n++] = 0x01; b[n++] = 0x00; b[n++] = 0x01;
+    memcpy(b + n, &r.addr, 4); n += 4;
+    b[n++] = 0; b[n++] = 53;
+    if (send(d->sock, (char *)b, n, 0) != n) { dnsq_free(d); return; }
+    d->st = CS_REQUEST;
+}
+
+static void dns_on_readable(DnsQ *d)
+{
+    BOOL dead;
+    int n;
+
+    switch (d->st) {
+    case CS_GREET:
+        if (!hs_fill(d->sock, d->hs, &d->hslen, 2, &dead)) { if (dead) dnsq_free(d); return; }
+        if (d->hs[0] != 0x05) { dnsq_free(d); return; }
+        { unsigned char m = d->hs[1]; d->hslen = 0;
+          if (m == 0x02) {
+              size_t ul = strlen(g_cfg.user), pl = strlen(g_cfg.pass);
+              unsigned char a[600]; int k = 0;
+              a[k++] = 0x01;
+              a[k++] = (unsigned char)ul; memcpy(a + k, g_cfg.user, ul); k += (int)ul;
+              a[k++] = (unsigned char)pl; memcpy(a + k, g_cfg.pass, pl); k += (int)pl;
+              if (send(d->sock, (char *)a, k, 0) != k) { dnsq_free(d); return; }
+              d->st = CS_AUTH;
+          } else if (m == 0x00) dns_send_request(d);
+          else dnsq_free(d); }
+        return;
+
+    case CS_AUTH:
+        if (!hs_fill(d->sock, d->hs, &d->hslen, 2, &dead)) { if (dead) dnsq_free(d); return; }
+        if (d->hs[1] != 0x00) { dnsq_free(d); return; }
+        d->hslen = 0;
+        dns_send_request(d);
+        return;
+
+    case CS_REQUEST: {
+        int need;
+        if (!hs_fill(d->sock, d->hs, &d->hslen, 4, &dead)) { if (dead) dnsq_free(d); return; }
+        if (d->hs[0] != 0x05 || d->hs[1] != 0x00) { dnsq_free(d); return; }
+        need = (d->hs[3] == 0x01) ? 4 + 4 + 2 : (d->hs[3] == 0x04) ? 4 + 16 + 2 : -1;
+        if (need < 0) {
+            if (!hs_fill(d->sock, d->hs, &d->hslen, 5, &dead)) { if (dead) dnsq_free(d); return; }
+            need = 4 + 1 + d->hs[4] + 2;
+        }
+        if (!hs_fill(d->sock, d->hs, &d->hslen, need, &dead)) { if (dead) dnsq_free(d); return; }
+        d->hslen = 0;
+        d->st = CS_OPEN;
+        if (send(d->sock, d->q, d->qlen, 0) == d->qlen) d->qsent = d->qlen;
+        return;
+    }
+
+    case CS_OPEN: {
+        int room = (int)sizeof(d->r) - d->rlen;
+        if (room <= 0) { dnsq_free(d); return; }
+        n = recv(d->sock, d->r + d->rlen, room, 0);
+        if (n <= 0) { dnsq_free(d); return; }
+        d->rlen += n;
+        if (d->rlen >= 2) {
+            int want = ((unsigned char)d->r[0] << 8) | (unsigned char)d->r[1];
+            if (d->rlen >= want + 2) {
+                struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)want, PBUF_RAM);
+                if (p) {
+                    pbuf_take(p, d->r + 2, (u16_t)want);   /* префикс длины снимаем */
+                    udp_sendto(g_udp, p, &d->from, d->fromport);
+                    pbuf_free(p);
+                }
+                dnsq_free(d);
+            }
+        }
+        return;
+    }
+    default: return;
+    }
+}
+
+static void dns_pump(void)
+{
+    int i;
+    DWORD now = GetTickCount();
+    for (i = 0; i < MAX_DNSQ; i++) {
+        DnsQ *d = &g_dns[i];
+        WSANETWORKEVENTS ne;
+        if (!d->used) continue;
+        if (now - d->started > DNS_TTL_MS) { dnsq_free(d); continue; }
+        if (d->sock == INVALID_SOCKET) { dnsq_free(d); continue; }
+        if (WSAEnumNetworkEvents(d->sock, d->ev, &ne) != 0) continue;
+        if (ne.lNetworkEvents & FD_CONNECT) {
+            if (ne.iErrorCode[FD_CONNECT_BIT] != 0) { dnsq_free(d); continue; }
+            dns_send_greeting(d);
+        }
+        if (ne.lNetworkEvents & FD_READ)  dns_on_readable(d);
+        if (ne.lNetworkEvents & FD_CLOSE) { if (d->used) dnsq_free(d); }
+    }
 }
 
 /* --------------------------------------------------------------- netif */
@@ -464,12 +700,14 @@ static DWORD WINAPI loop_thread(LPVOID arg)
         }
         handle_socket_events();
         pump_all();
+        dns_pump();
         sys_check_timeouts();
     }
 
     {
         int i;
         for (i = 0; i < MAX_CONNS; i++) conn_kill(&g_conns[i]);
+        for (i = 0; i < MAX_DNSQ;  i++) dnsq_free(&g_dns[i]);
     }
     return 0;
 }
@@ -515,6 +753,15 @@ BOOL tunnel_start(const TunnelCfg *cfg, char *err, size_t errcap)
     }
     g_listener->local_port = 0;
     tcp_accept(g_listener, lw_accept);
+
+    /* DNS: udp_input сопоставляет pcb по порту, а адрес у нас уже принят
+     * флагом ACCEPT_ANY — поэтому один pcb на порту 53 ловит запросы к любому
+     * адресу, и патчить lwIP ради UDP не требуется. */
+    g_udp = udp_new();
+    if (g_udp) {
+        udp_bind(g_udp, IP_ANY_TYPE, 53);
+        udp_recv(g_udp, dns_on_query, NULL);
+    }
 
     g_stop = 0;
     g_stop_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
