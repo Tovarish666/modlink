@@ -323,7 +323,13 @@ tcp_input(struct pbuf *p, struct netif *inp)
         continue;
       }
 
-      if (lpcb->local_port == tcphdr->dest) {
+      /* MODLINK PATCH 1/2 — см. third_party/lwip/PATCHES.md
+       * Слушатель с портом 0 на интерфейсе ACCEPT_ANY ловит любой порт
+       * назначения. Ноль выбран как метка не случайно: это не валидный TCP-порт,
+       * поэтому настоящий слушатель им никогда не окажется и коллизии нет. */
+      if (lpcb->local_port == tcphdr->dest ||
+          (lpcb->local_port == 0 && ip_data.current_input_netif != NULL &&
+           (ip_data.current_input_netif->flags & NETIF_FLAG_ACCEPT_ANY))) {
         if (IP_IS_ANY_TYPE_VAL(lpcb->local_ip)) {
           /* found an ANY TYPE (IPv4/IPv6) match */
 #if SO_REUSE
@@ -675,7 +681,11 @@ tcp_listen_input(struct tcp_pcb_listen *pcb)
     /* Set up the new PCB. */
     ip_addr_copy(npcb->local_ip, *ip_current_dest_addr());
     ip_addr_copy(npcb->remote_ip, *ip_current_src_addr());
-    npcb->local_port = pcb->local_port;
+    /* MODLINK PATCH 2/2 — порт назначения берём из пакета, а не от слушателя.
+     * Адрес строкой выше уже настоящий, и вместе они дают нам полный оригинальный
+     * адресат — именно его агент передаёт в SOCKS5. Обычному слушателю это
+     * ничего не меняет: у него local_port никогда не ноль. */
+    npcb->local_port = (pcb->local_port == 0) ? tcphdr->dest : pcb->local_port;
     npcb->remote_port = tcphdr->src;
     npcb->state = SYN_RCVD;
     npcb->rcv_nxt = seqno + 1;
