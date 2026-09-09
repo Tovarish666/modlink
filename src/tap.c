@@ -138,40 +138,39 @@ BOOL tap_get_mac(HANDLE h, unsigned char mac[6])
 }
 
 /* ------------------------------------------------------------- обмен */
-int tap_read(HANDLE h, void *buf, int cap, int timeout_ms)
+BOOL tap_read_begin(HANDLE h, void *buf, int cap, OVERLAPPED *ov, BOOL *completed)
 {
-    OVERLAPPED ov;
     DWORD got = 0;
+    HANDLE ev = ov->hEvent;
 
-    memset(&ov, 0, sizeof(ov));
-    ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
-    if (!ov.hEvent) return -1;
+    *completed = FALSE;
+    memset(ov, 0, sizeof(*ov));
+    ov->hEvent = ev;
+    ResetEvent(ev);
 
-    if (ReadFile(h, buf, (DWORD)cap, &got, &ov)) {
-        CloseHandle(ov.hEvent);
-        return (int)got;
+    if (ReadFile(h, buf, (DWORD)cap, &got, ov)) {
+        *completed = TRUE;          /* успело синхронно */
+        return TRUE;
     }
-    if (GetLastError() != ERROR_IO_PENDING) {
-        CloseHandle(ov.hEvent);
-        return -1;
-    }
+    return GetLastError() == ERROR_IO_PENDING;
+}
 
-    switch (WaitForSingleObject(ov.hEvent, (DWORD)timeout_ms)) {
-    case WAIT_OBJECT_0:
-        if (!GetOverlappedResult(h, &ov, &got, FALSE)) got = 0;
-        CloseHandle(ov.hEvent);
-        return (int)got;
-    case WAIT_TIMEOUT:
-        /* Отменяем именно эту операцию, иначе следующий вызов получит чужой
-         * результат в тот же буфер. */
-        CancelIoEx(h, &ov);
-        GetOverlappedResult(h, &ov, &got, TRUE);
-        CloseHandle(ov.hEvent);
-        return 0;
-    default:
-        CloseHandle(ov.hEvent);
-        return -1;
+BOOL tap_read_end(HANDLE h, OVERLAPPED *ov, int *got)
+{
+    DWORD n = 0;
+    if (!GetOverlappedResult(h, ov, &n, FALSE)) {
+        *got = 0;
+        return GetLastError() == ERROR_IO_INCOMPLETE;
     }
+    *got = (int)n;
+    return TRUE;
+}
+
+void tap_read_cancel(HANDLE h, OVERLAPPED *ov)
+{
+    DWORD n = 0;
+    CancelIoEx(h, ov);
+    GetOverlappedResult(h, ov, &n, TRUE);
 }
 
 BOOL tap_write(HANDLE h, const void *buf, int len)

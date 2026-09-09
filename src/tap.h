@@ -31,10 +31,20 @@ void   tap_close(HANDLE h);
 /* MAC, который драйвер реально использует. */
 BOOL tap_get_mac(HANDLE h, unsigned char mac[6]);
 
-/* Блокирующие чтение и запись Ethernet-кадра целиком.
- * tap_read ждёт не дольше timeout_ms; 0 означает «истёк таймаут, кадра нет»,
- * отрицательное — ошибку устройства. */
-int  tap_read (HANDLE h, void *buf, int cap, int timeout_ms);
+/* Запись кадра целиком. */
 BOOL tap_write(HANDLE h, const void *buf, int len);
+
+/* Асинхронное чтение в два шага. Так петля может ждать сразу и кадр, и события
+ * сокетов одним WaitForMultipleObjects, вместо того чтобы опрашивать по таймеру:
+ * при сорока интерфейсах опрос стоил бы тысячи холостых пробуждений в секунду.
+ *
+ *   tap_read_begin — ставит операцию в очередь; ov->hEvent должен быть создан
+ *                    вызывающим и переиспользуется между вызовами.
+ *   tap_read_end   — забирает результат, когда событие сработало.
+ *
+ * Обе возвращают FALSE при ошибке устройства. */
+BOOL tap_read_begin(HANDLE h, void *buf, int cap, OVERLAPPED *ov, BOOL *completed);
+BOOL tap_read_end  (HANDLE h, OVERLAPPED *ov, int *got);
+void tap_read_cancel(HANDLE h, OVERLAPPED *ov);
 
 #endif

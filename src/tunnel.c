@@ -44,7 +44,6 @@ typedef struct {
     ConnState       st;
     struct tcp_pcb *pcb;        /* сторона lwIP */
     SOCKET          sock;       /* сторона прокси */
-    WSAEVENT        ev;
     ip4_addr_t      dst_ip;     /* куда клиент на самом деле шёл */
     u16_t           dst_port;
 
@@ -74,6 +73,11 @@ static struct netif    g_netif;
 static HANDLE          g_tap = INVALID_HANDLE_VALUE;
 static HANDLE          g_thread = NULL;
 static HANDLE          g_stop_ev = NULL;
+/* Одно событие на все сокеты сразу: WSAEventSelect это разрешает, и тогда
+ * петля ждёт три объекта вместо сотен — иначе упёрлись бы в MAXIMUM_WAIT_OBJECTS
+ * (64), а соединений может быть 256. Кто именно проснулся, выясняет
+ * WSAEnumNetworkEvents при обходе. */
+static WSAEVENT        g_sock_ev = WSA_INVALID_EVENT;
 static volatile LONG   g_stop = 0;
 static TunnelCfg       g_cfg;
 static struct tcp_pcb *g_listener = NULL;
@@ -89,7 +93,6 @@ static ip4_addr_t      g_netif_ip;
 typedef struct {
     BOOL      used;
     SOCKET    sock;
-    WSAEVENT  ev;
     ConnState st;
     unsigned char hs[300]; int hslen;     /* накопитель ответов SOCKS5 */
     char      q[1024]; int qlen, qsent;   /* запрос с 2-байтовым префиксом длины */
@@ -141,7 +144,6 @@ static void conn_kill(Conn *c)
         c->pcb = NULL;
     }
     if (c->sock != INVALID_SOCKET) { closesocket(c->sock); c->sock = INVALID_SOCKET; }
-    if (c->ev) { WSACloseEvent(c->ev); c->ev = 0; }
     c->st = CS_FREE;
     if (g_active > 0) g_active--;
 }
@@ -256,9 +258,7 @@ static err_t lw_accept(void *arg, struct tcp_pcb *pcb, err_t err)
     /* Соединяемся с прокси неблокирующе: петля не имеет права встать. */
     c->sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (c->sock == INVALID_SOCKET) { conn_kill(c); return ERR_ABRT; }
-    c->ev = WSACreateEvent();
-    if (!c->ev) { conn_kill(c); return ERR_ABRT; }
-    WSAEventSelect(c->sock, c->ev, FD_CONNECT | FD_READ | FD_WRITE | FD_CLOSE);
+    WSAEventSelect(c->sock, g_sock_ev, FD_CONNECT | FD_READ | FD_WRITE | FD_CLOSE);
 
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
@@ -445,7 +445,6 @@ static void dnsq_free(DnsQ *d)
 {
     if (!d->used) return;
     if (d->sock != INVALID_SOCKET) { closesocket(d->sock); d->sock = INVALID_SOCKET; }
-    if (d->ev) { WSACloseEvent(d->ev); d->ev = 0; }
     d->used = FALSE;
 }
 
@@ -479,9 +478,7 @@ static void dns_on_query(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
     d->sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (d->sock == INVALID_SOCKET) { dnsq_free(d); return; }
-    d->ev = WSACreateEvent();
-    if (!d->ev) { dnsq_free(d); return; }
-    WSAEventSelect(d->sock, d->ev, FD_CONNECT | FD_READ | FD_WRITE | FD_CLOSE);
+    WSAEventSelect(d->sock, g_sock_ev, FD_CONNECT | FD_READ | FD_WRITE | FD_CLOSE);
 
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
@@ -593,7 +590,7 @@ static void dns_pump(void)
         if (!d->used) continue;
         if (now - d->started > DNS_TTL_MS) { dnsq_free(d); continue; }
         if (d->sock == INVALID_SOCKET) { dnsq_free(d); continue; }
-        if (WSAEnumNetworkEvents(d->sock, d->ev, &ne) != 0) continue;
+        if (WSAEnumNetworkEvents(d->sock, NULL, &ne) != 0) continue;
         if (ne.lNetworkEvents & FD_CONNECT) {
             if (ne.iErrorCode[FD_CONNECT_BIT] != 0) { dnsq_free(d); continue; }
             dns_send_greeting(d);
@@ -665,7 +662,7 @@ static void handle_socket_events(void)
         Conn *c = &g_conns[i];
         WSANETWORKEVENTS ne;
         if (c->st == CS_FREE || c->st == CS_DEAD || c->sock == INVALID_SOCKET) continue;
-        if (WSAEnumNetworkEvents(c->sock, c->ev, &ne) != 0) continue;
+        if (WSAEnumNetworkEvents(c->sock, NULL, &ne) != 0) continue;
 
         if (ne.lNetworkEvents & FD_CONNECT) {
             if (ne.iErrorCode[FD_CONNECT_BIT] != 0) { ml_log("tunnel: connect к прокси не удался (%d)", ne.iErrorCode[FD_CONNECT_BIT]); c->st = CS_DEAD; continue; }
@@ -684,25 +681,74 @@ static void handle_socket_events(void)
 static DWORD WINAPI loop_thread(LPVOID arg)
 {
     static char frame[TAP_FRAME_MAX];
+    OVERLAPPED  ov;
+    HANDLE      wait[3];
+    BOOL        pending = FALSE;
     (void)arg;
 
-    while (!InterlockedCompareExchange(&g_stop, 0, 0)) {
-        int n = tap_read(g_tap, frame, sizeof(frame), LOOP_TICK_MS);
-        if (n > 0) {
-            struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)n, PBUF_POOL);
-            if (p) {
-                pbuf_take(p, frame, (u16_t)n);
-                if (g_netif.input(p, &g_netif) != ERR_OK) pbuf_free(p);
+    memset(&ov, 0, sizeof(ov));
+    ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!ov.hEvent) return 0;
+
+    wait[0] = g_stop_ev;
+    wait[1] = ov.hEvent;
+    wait[2] = (HANDLE)g_sock_ev;
+
+    for (;;) {
+        DWORD timeout, w;
+        BOOL done = FALSE;
+
+        /* Держим ровно одно чтение в очереди. Пока оно висит, поток спит. */
+        if (!pending) {
+            if (!tap_read_begin(g_tap, frame, sizeof(frame), &ov, &done)) {
+                ml_log("tunnel: TAP read failed, stopping");
+                break;
             }
-        } else if (n < 0) {
-            ml_log("tunnel: TAP read failed, stopping");
-            break;
+            pending = TRUE;
+            if (done) { SetEvent(ov.hEvent); }
         }
+
+        /* Спим ровно до ближайшего таймера lwIP — не дольше и не короче.
+         * Никакого опроса: просыпаемся только на кадр, событие сокета,
+         * истёкший таймер или остановку. */
+        timeout = sys_timeouts_sleeptime();
+        if (timeout == SYS_TIMEOUTS_SLEEPTIME_INFINITE) timeout = 1000;
+        else if (timeout > 1000) timeout = 1000;
+
+        w = WaitForMultipleObjects(3, wait, FALSE, timeout);
+        if (w == WAIT_OBJECT_0) break;                      /* остановка */
+
+        if (w == WAIT_OBJECT_0 + 1) {                       /* пришёл кадр */
+            int got = 0;
+            pending = FALSE;
+            if (!tap_read_end(g_tap, &ov, &got)) {
+                ml_log("tunnel: TAP read failed, stopping");
+                break;
+            }
+            if (got > 0) {
+                struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)got, PBUF_POOL);
+                if (p) {
+                    pbuf_take(p, frame, (u16_t)got);
+                    if (g_netif.input(p, &g_netif) != ERR_OK) pbuf_free(p);
+                }
+            }
+        } else if (w == WAIT_OBJECT_0 + 2) {
+            /* Событие общее, поэтому сбрасываем его сами и перечисляем сокеты
+             * с NULL — так WSAEnumNetworkEvents не сбросит его за нас и сигнал,
+             * пришедший во время обхода, не потеряется. */
+            WSAResetEvent(g_sock_ev);
+        }
+
         handle_socket_events();
         pump_all();
         dns_pump();
         sys_check_timeouts();
+
+        if (InterlockedCompareExchange(&g_stop, 0, 0)) break;
     }
+
+    if (pending) tap_read_cancel(g_tap, &ov);
+    CloseHandle(ov.hEvent);
 
     {
         int i;
@@ -763,6 +809,11 @@ BOOL tunnel_start(const TunnelCfg *cfg, char *err, size_t errcap)
         udp_recv(g_udp, dns_on_query, NULL);
     }
 
+    g_sock_ev = WSACreateEvent();
+    if (g_sock_ev == WSA_INVALID_EVENT) {
+        if (err) ml_strlcpy(err, "не удалось создать событие сокетов", errcap);
+        return FALSE;
+    }
     g_stop = 0;
     g_stop_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
     g_thread  = CreateThread(NULL, 0, loop_thread, NULL, 0, NULL);
@@ -780,9 +831,11 @@ void tunnel_stop(void)
 {
     if (!g_thread) return;
     InterlockedExchange(&g_stop, 1);
+    if (g_stop_ev) SetEvent(g_stop_ev);      /* будим петлю, а не ждём таймаута */
     WaitForSingleObject(g_thread, 5000);
     CloseHandle(g_thread);
     g_thread = NULL;
     if (g_stop_ev) { CloseHandle(g_stop_ev); g_stop_ev = NULL; }
+    if (g_sock_ev != WSA_INVALID_EVENT) { WSACloseEvent(g_sock_ev); g_sock_ev = WSA_INVALID_EVENT; }
     if (g_tap != INVALID_HANDLE_VALUE) { tap_close(g_tap); g_tap = INVALID_HANDLE_VALUE; }
 }
