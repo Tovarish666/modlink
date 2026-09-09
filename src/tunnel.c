@@ -30,6 +30,8 @@
 #define DIE(c, why) do { ml_log("tunnel: conn dead (%s) st=%d", (why), (int)(c)->st);                          (c)->st = CS_DEAD; } while (0)
 
 /* --------------------------------------------------------------- состояние */
+typedef struct Iface Iface;      /* определён ниже; на него ссылаются Conn и DnsQ */
+
 typedef enum {
     CS_FREE = 0,
     CS_CONNECTING,   /* TCP до прокси в процессе */
@@ -42,6 +44,7 @@ typedef enum {
 
 typedef struct {
     ConnState       st;
+    Iface          *ifc;        /* через какой модем уходить */
     struct tcp_pcb *pcb;        /* сторона lwIP */
     SOCKET          sock;       /* сторона прокси */
     ip4_addr_t      dst_ip;     /* куда клиент на самом деле шёл */
@@ -68,9 +71,24 @@ typedef struct {
     unsigned char hs[300]; int hslen;
 } Conn;
 
+/* Всё, что раньше было глобальным на единственный туннель, теперь живёт здесь.
+ * netif->state указывает на свой Iface — так обработчики lwIP узнают, через
+ * какой модем уходить, не заводя таблиц соответствия. */
+struct Iface {
+    BOOL         used;
+    TunnelCfg    cfg;
+    ip4_addr_t   ip;
+    HANDLE       tap;
+    OVERLAPPED   ov;
+    BOOL         pending;
+    struct netif netif;
+    char         frame[TAP_FRAME_MAX];
+};
+
+static Iface           g_ifaces[TUNNEL_MAX_IFACES];
+static int             g_niface = 0;
+
 static Conn            g_conns[MAX_CONNS];
-static struct netif    g_netif;
-static HANDLE          g_tap = INVALID_HANDLE_VALUE;
 static HANDLE          g_thread = NULL;
 static HANDLE          g_stop_ev = NULL;
 /* Одно событие на все сокеты сразу: WSAEventSelect это разрешает, и тогда
@@ -79,9 +97,7 @@ static HANDLE          g_stop_ev = NULL;
  * WSAEnumNetworkEvents при обходе. */
 static WSAEVENT        g_sock_ev = WSA_INVALID_EVENT;
 static volatile LONG   g_stop = 0;
-static TunnelCfg       g_cfg;
 static struct tcp_pcb *g_listener = NULL;
-static ip4_addr_t      g_netif_ip;
 
 /* ------------------------------------------------------------ DNS
  * Запросы уводим по TCP через тот же прокси. Пустить UDP мимо туннеля нельзя:
@@ -92,6 +108,7 @@ static ip4_addr_t      g_netif_ip;
 
 typedef struct {
     BOOL      used;
+    Iface    *ifc;
     SOCKET    sock;
     ConnState st;
     unsigned char hs[300]; int hslen;     /* накопитель ответов SOCKS5 */
@@ -234,6 +251,14 @@ static err_t lw_accept(void *arg, struct tcp_pcb *pcb, err_t err)
     c = conn_alloc();
     if (!c) { tcp_abort(pcb); return ERR_ABRT; }
 
+    /* Через какой модем уходить,знает сам lwIP: пакет пришёл на конкретный
+     * netif, а в его state лежит наш интерфейс. Таблиц соответствия не нужно. */
+    {
+        struct netif *in = ip_current_netif();
+        if (!in || !in->state) { conn_kill(c); tcp_abort(pcb); return ERR_ABRT; }
+        c->ifc = (Iface *)in->state;
+    }
+
     /* Благодаря правкам в lwIP здесь лежит НАСТОЯЩИЙ адресат, куда шёл клиент,
      * а не адрес нашего интерфейса. Ради этого патчи и делались. */
     ip4_addr_copy(c->dst_ip, *ip_2_ip4(&pcb->local_ip));
@@ -244,8 +269,8 @@ static err_t lw_accept(void *arg, struct tcp_pcb *pcb, err_t err)
     /* Клиент постучался на адрес самого интерфейса — значит ему нужна морда
      * модема. Подменяем адресата на настоящий и включаем правку заголовков.
      * Отдельный сокет для этого не нужен: слушатель-ловушка и так поймал всё. */
-    if (g_cfg.real_ip[0] && c->dst_ip.addr == g_netif_ip.addr && c->dst_port == 80) {
-        ip4addr_aton(g_cfg.real_ip, &c->dst_ip);
+    if (c->ifc->cfg.real_ip[0] && c->dst_ip.addr == c->ifc->ip.addr && c->dst_port == 80) {
+        ip4addr_aton(c->ifc->cfg.real_ip, &c->dst_ip);
         c->mediated = TRUE;
     }
 
@@ -262,8 +287,8 @@ static err_t lw_accept(void *arg, struct tcp_pcb *pcb, err_t err)
 
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
-    a.sin_port   = htons((u_short)g_cfg.proxy_port);
-    a.sin_addr.s_addr = inet_addr(g_cfg.proxy_ip);
+    a.sin_port   = htons((u_short)c->ifc->cfg.proxy_port);
+    a.sin_addr.s_addr = inet_addr(c->ifc->cfg.proxy_ip);
     if (connect(c->sock, (struct sockaddr *)&a, sizeof(a)) != 0 &&
         WSAGetLastError() != WSAEWOULDBLOCK) {
         conn_kill(c);
@@ -278,7 +303,7 @@ static void socks_send_greeting(Conn *c)
     unsigned char b[4];
     int n = 0;
     b[n++] = 0x05;
-    if (g_cfg.user[0]) { b[n++] = 2; b[n++] = 0x00; b[n++] = 0x02; }
+    if (c->ifc->cfg.user[0]) { b[n++] = 2; b[n++] = 0x00; b[n++] = 0x02; }
     else               { b[n++] = 1; b[n++] = 0x00; }
     if (!sock_send_all(c, b, n)) { c->st = CS_DEAD; return; }
     c->st = CS_GREET;
@@ -287,11 +312,11 @@ static void socks_send_greeting(Conn *c)
 static void socks_send_auth(Conn *c)
 {
     unsigned char b[600];
-    size_t ul = strlen(g_cfg.user), pl = strlen(g_cfg.pass);
+    size_t ul = strlen(c->ifc->cfg.user), pl = strlen(c->ifc->cfg.pass);
     int n = 0;
     b[n++] = 0x01;
-    b[n++] = (unsigned char)ul; memcpy(b + n, g_cfg.user, ul); n += (int)ul;
-    b[n++] = (unsigned char)pl; memcpy(b + n, g_cfg.pass, pl); n += (int)pl;
+    b[n++] = (unsigned char)ul; memcpy(b + n, c->ifc->cfg.user, ul); n += (int)ul;
+    b[n++] = (unsigned char)pl; memcpy(b + n, c->ifc->cfg.pass, pl); n += (int)pl;
     if (!sock_send_all(c, b, n)) { c->st = CS_DEAD; return; }
     c->st = CS_AUTH;
 }
@@ -396,7 +421,7 @@ static void drain_up(Conn *c)          /* клиент → прокси */
             c->req_fixed = TRUE;                   /* заголовки безумного размера — шлём как есть */
         } else {
             c->up_len = hrw_rewrite_header(c->up, c->up_len, BUF_SIZE,
-                                           "Host:", g_cfg.virt_ip, g_cfg.real_ip);
+                                           "Host:", c->ifc->cfg.virt_ip, c->ifc->cfg.real_ip);
             c->up_len = hrw_force_close(c->up, c->up_len, BUF_SIZE);
             c->req_fixed = TRUE;
         }
@@ -427,7 +452,7 @@ static void drain_down(Conn *c)        /* прокси → клиент */
             c->resp_fixed = TRUE;
         } else {
             c->dn_len = hrw_rewrite_header(c->dn, c->dn_len, BUF_SIZE,
-                                           "Location:", g_cfg.real_ip, g_cfg.virt_ip);
+                                           "Location:", c->ifc->cfg.real_ip, c->ifc->cfg.virt_ip);
             c->resp_fixed = TRUE;
         }
     }
@@ -462,7 +487,12 @@ static void dns_on_query(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     for (i = 0; i < MAX_DNSQ; i++) if (!g_dns[i].used) { d = &g_dns[i]; break; }
     if (!d) { pbuf_free(p); return; }
 
-    memset(d, 0, sizeof(*d));
+    {
+        struct netif *in = ip_current_netif();
+        if (!in || !in->state) { pbuf_free(p); return; }
+        memset(d, 0, sizeof(*d));
+        d->ifc = (Iface *)in->state;
+    }
     d->used = TRUE;
     d->sock = INVALID_SOCKET;
     d->started = GetTickCount();
@@ -482,8 +512,8 @@ static void dns_on_query(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
-    a.sin_port   = htons((u_short)g_cfg.proxy_port);
-    a.sin_addr.s_addr = inet_addr(g_cfg.proxy_ip);
+    a.sin_port   = htons((u_short)d->ifc->cfg.proxy_port);
+    a.sin_addr.s_addr = inet_addr(d->ifc->cfg.proxy_ip);
     if (connect(d->sock, (struct sockaddr *)&a, sizeof(a)) != 0 &&
         WSAGetLastError() != WSAEWOULDBLOCK) { dnsq_free(d); return; }
     d->st = CS_CONNECTING;
@@ -493,7 +523,7 @@ static void dns_send_greeting(DnsQ *d)
 {
     unsigned char b[4]; int n = 0;
     b[n++] = 0x05;
-    if (g_cfg.user[0]) { b[n++] = 2; b[n++] = 0x00; b[n++] = 0x02; }
+    if (d->ifc->cfg.user[0]) { b[n++] = 2; b[n++] = 0x00; b[n++] = 0x02; }
     else               { b[n++] = 1; b[n++] = 0x00; }
     if (send(d->sock, (char *)b, n, 0) != n) { dnsq_free(d); return; }
     d->st = CS_GREET;
@@ -503,7 +533,7 @@ static void dns_send_request(DnsQ *d)
 {
     unsigned char b[16]; int n = 0;
     ip4_addr_t r;
-    ip4addr_aton(g_cfg.dns_ip[0] ? g_cfg.dns_ip : "1.1.1.1", &r);
+    ip4addr_aton(d->ifc->cfg.dns_ip[0] ? d->ifc->cfg.dns_ip : "1.1.1.1", &r);
     b[n++] = 0x05; b[n++] = 0x01; b[n++] = 0x00; b[n++] = 0x01;
     memcpy(b + n, &r.addr, 4); n += 4;
     b[n++] = 0; b[n++] = 53;
@@ -522,11 +552,11 @@ static void dns_on_readable(DnsQ *d)
         if (d->hs[0] != 0x05) { dnsq_free(d); return; }
         { unsigned char m = d->hs[1]; d->hslen = 0;
           if (m == 0x02) {
-              size_t ul = strlen(g_cfg.user), pl = strlen(g_cfg.pass);
+              size_t ul = strlen(d->ifc->cfg.user), pl = strlen(d->ifc->cfg.pass);
               unsigned char a[600]; int k = 0;
               a[k++] = 0x01;
-              a[k++] = (unsigned char)ul; memcpy(a + k, g_cfg.user, ul); k += (int)ul;
-              a[k++] = (unsigned char)pl; memcpy(a + k, g_cfg.pass, pl); k += (int)pl;
+              a[k++] = (unsigned char)ul; memcpy(a + k, d->ifc->cfg.user, ul); k += (int)ul;
+              a[k++] = (unsigned char)pl; memcpy(a + k, d->ifc->cfg.pass, pl); k += (int)pl;
               if (send(d->sock, (char *)a, k, 0) != k) { dnsq_free(d); return; }
               d->st = CS_AUTH;
           } else if (m == 0x00) dns_send_request(d);
@@ -603,29 +633,34 @@ static void dns_pump(void)
 /* --------------------------------------------------------------- netif */
 static err_t netif_linkoutput(struct netif *nif, struct pbuf *p)
 {
-    static char frame[TAP_FRAME_MAX];
+    /* Буфер на стеке, а не статический: интерфейсов много, и общий буфер
+     * пришлось бы защищать — при том что поток всё равно один. */
+    char frame[TAP_FRAME_MAX];
+    Iface *ifc = (Iface *)nif->state;
     struct pbuf *q;
     int len = 0;
-    (void)nif;
 
+    if (!ifc) return ERR_IF;
     for (q = p; q != NULL; q = q->next) {
         if (len + q->len > (int)sizeof(frame)) return ERR_BUF;
         memcpy(frame + len, q->payload, q->len);
         len += q->len;
     }
-    return tap_write(g_tap, frame, len) ? ERR_OK : ERR_IF;
+    return tap_write(ifc->tap, frame, len) ? ERR_OK : ERR_IF;
 }
 
 static err_t netif_init_cb(struct netif *nif)
 {
+    Iface *ifc = (Iface *)nif->state;
     unsigned char mac[6];
 
+    if (!ifc) return ERR_ARG;
     nif->name[0] = 'm'; nif->name[1] = 'l';
     nif->output     = etharp_output;
     nif->linkoutput = netif_linkoutput;
     nif->mtu        = TAP_MTU;
     nif->hwaddr_len = 6;
-    if (!tap_get_mac(g_tap, mac)) memset(mac, 0, 6);
+    if (!tap_get_mac(ifc->tap, mac)) memset(mac, 0, 6);
     memcpy(nif->hwaddr, mac, 6);
 
     /* ACCEPT_ANY — наша правка: без неё lwIP выбросит всё, что адресовано не
@@ -680,63 +715,65 @@ static void handle_socket_events(void)
 
 static DWORD WINAPI loop_thread(LPVOID arg)
 {
-    static char frame[TAP_FRAME_MAX];
-    OVERLAPPED  ov;
-    HANDLE      wait[3];
-    BOOL        pending = FALSE;
+    /* Ждём: [0] остановка, [1] события всех сокетов, дальше по одному
+     * событию на интерфейс. Сорок адаптеров дают 42 объекта — с запасом
+     * укладывается в лимит WaitForMultipleObjects в 64. */
+    HANDLE wait[2 + TUNNEL_MAX_IFACES];
+    int    map[TUNNEL_MAX_IFACES];
+    int    nwait, i;
     (void)arg;
-
-    memset(&ov, 0, sizeof(ov));
-    ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
-    if (!ov.hEvent) return 0;
-
-    wait[0] = g_stop_ev;
-    wait[1] = ov.hEvent;
-    wait[2] = (HANDLE)g_sock_ev;
 
     for (;;) {
         DWORD timeout, w;
-        BOOL done = FALSE;
 
-        /* Держим ровно одно чтение в очереди. Пока оно висит, поток спит. */
-        if (!pending) {
-            if (!tap_read_begin(g_tap, frame, sizeof(frame), &ov, &done)) {
-                ml_log("tunnel: TAP read failed, stopping");
-                break;
+        /* Держим по одному чтению в очереди на каждый интерфейс. Пока все
+         * висят, поток спит. */
+        nwait = 0;
+        wait[nwait++] = g_stop_ev;
+        wait[nwait++] = (HANDLE)g_sock_ev;
+        for (i = 0; i < g_niface; i++) {
+            Iface *f = &g_ifaces[i];
+            if (!f->used) continue;
+            if (!f->pending) {
+                BOOL done = FALSE;
+                if (!tap_read_begin(f->tap, f->frame, sizeof(f->frame), &f->ov, &done)) {
+                    ml_log("tunnel[%s]: чтение из TAP не удалось, интерфейс снят", f->cfg.label);
+                    f->used = FALSE;
+                    continue;
+                }
+                f->pending = TRUE;
+                if (done) SetEvent(f->ov.hEvent);
             }
-            pending = TRUE;
-            if (done) { SetEvent(ov.hEvent); }
+            map[nwait - 2] = i;
+            wait[nwait++] = f->ov.hEvent;
         }
 
-        /* Спим ровно до ближайшего таймера lwIP — не дольше и не короче.
-         * Никакого опроса: просыпаемся только на кадр, событие сокета,
-         * истёкший таймер или остановку. */
         timeout = sys_timeouts_sleeptime();
         if (timeout == SYS_TIMEOUTS_SLEEPTIME_INFINITE) timeout = 1000;
         else if (timeout > 1000) timeout = 1000;
 
-        w = WaitForMultipleObjects(3, wait, FALSE, timeout);
+        w = WaitForMultipleObjects((DWORD)nwait, wait, FALSE, timeout);
         if (w == WAIT_OBJECT_0) break;                      /* остановка */
 
-        if (w == WAIT_OBJECT_0 + 1) {                       /* пришёл кадр */
+        if (w == WAIT_OBJECT_0 + 1) {
+            /* Событие сокетов общее, поэтому сбрасываем его сами и перечисляем
+             * с NULL — иначе WSAEnumNetworkEvents сбросит его за нас и сигнал,
+             * пришедший во время обхода, потеряется. */
+            WSAResetEvent(g_sock_ev);
+        } else if (w > WAIT_OBJECT_0 + 1 && w < WAIT_OBJECT_0 + (DWORD)nwait) {
+            Iface *f = &g_ifaces[map[w - WAIT_OBJECT_0 - 2]];
             int got = 0;
-            pending = FALSE;
-            if (!tap_read_end(g_tap, &ov, &got)) {
-                ml_log("tunnel: TAP read failed, stopping");
-                break;
-            }
-            if (got > 0) {
+            f->pending = FALSE;
+            if (!tap_read_end(f->tap, &f->ov, &got)) {
+                ml_log("tunnel[%s]: чтение из TAP не удалось, интерфейс снят", f->cfg.label);
+                f->used = FALSE;
+            } else if (got > 0) {
                 struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)got, PBUF_POOL);
                 if (p) {
-                    pbuf_take(p, frame, (u16_t)got);
-                    if (g_netif.input(p, &g_netif) != ERR_OK) pbuf_free(p);
+                    pbuf_take(p, f->frame, (u16_t)got);
+                    if (f->netif.input(p, &f->netif) != ERR_OK) pbuf_free(p);
                 }
             }
-        } else if (w == WAIT_OBJECT_0 + 2) {
-            /* Событие общее, поэтому сбрасываем его сами и перечисляем сокеты
-             * с NULL — так WSAEnumNetworkEvents не сбросит его за нас и сигнал,
-             * пришедший во время обхода, не потеряется. */
-            WSAResetEvent(g_sock_ev);
         }
 
         handle_socket_events();
@@ -747,47 +784,91 @@ static DWORD WINAPI loop_thread(LPVOID arg)
         if (InterlockedCompareExchange(&g_stop, 0, 0)) break;
     }
 
-    if (pending) tap_read_cancel(g_tap, &ov);
-    CloseHandle(ov.hEvent);
-
-    {
-        int i;
-        for (i = 0; i < MAX_CONNS; i++) conn_kill(&g_conns[i]);
-        for (i = 0; i < MAX_DNSQ;  i++) dnsq_free(&g_dns[i]);
-    }
+    for (i = 0; i < g_niface; i++)
+        if (g_ifaces[i].pending) tap_read_cancel(g_ifaces[i].tap, &g_ifaces[i].ov);
+    for (i = 0; i < MAX_CONNS; i++) conn_kill(&g_conns[i]);
+    for (i = 0; i < MAX_DNSQ;  i++) dnsq_free(&g_dns[i]);
     return 0;
 }
 
 /* --------------------------------------------------------------- запуск */
-BOOL tunnel_start(const TunnelCfg *cfg, char *err, size_t errcap)
+static BOOL iface_up(Iface *f, const TunnelCfg *cfg, char *err, size_t errcap)
 {
-    ip4_addr_t ip, mask, gw;
+    ip4_addr_t mask, gw;
+
+    memset(f, 0, sizeof(*f));
+    f->cfg = *cfg;
+    f->tap = INVALID_HANDLE_VALUE;
+
+    f->tap = tap_open(f->cfg.guid, err, errcap);
+    if (f->tap == INVALID_HANDLE_VALUE) return FALSE;
+
+    f->ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!f->ov.hEvent) {
+        if (err) ml_strlcpy(err, "не удалось создать событие чтения", errcap);
+        tap_close(f->tap); f->tap = INVALID_HANDLE_VALUE;
+        return FALSE;
+    }
+
+    ip4addr_aton(f->cfg.virt_ip, &f->ip);
+    ip4addr_aton(f->cfg.netmask[0] ? f->cfg.netmask : "255.255.255.0", &mask);
+    ip4_addr_set_zero(&gw);
+
+    /* state = сам интерфейс: по нему обработчики lwIP узнают, чей это пакет. */
+    if (!netif_add(&f->netif, &f->ip, &mask, &gw, f, netif_init_cb, ethernet_input)) {
+        if (err) ml_strlcpy(err, "не удалось создать netif", errcap);
+        CloseHandle(f->ov.hEvent);
+        tap_close(f->tap); f->tap = INVALID_HANDLE_VALUE;
+        return FALSE;
+    }
+    netif_set_up(&f->netif);
+    netif_set_link_up(&f->netif);
+
+    f->used = TRUE;
+    return TRUE;
+}
+
+BOOL tunnel_start(const TunnelCfg *cfgs, int count, char *err, size_t errcap)
+{
     struct tcp_pcb *pcb;
+    int i, up = 0;
 
-    g_cfg = *cfg;
     if (err && errcap) err[0] = 0;
+    if (count <= 0) {
+        if (err) ml_strlcpy(err, "список интерфейсов пуст", errcap);
+        return FALSE;
+    }
+    if (count > TUNNEL_MAX_IFACES) count = TUNNEL_MAX_IFACES;
 
-    g_tap = tap_open(g_cfg.guid, err, errcap);
-    if (g_tap == INVALID_HANDLE_VALUE) return FALSE;
+    g_sock_ev = WSACreateEvent();
+    if (g_sock_ev == WSA_INVALID_EVENT) {
+        if (err) ml_strlcpy(err, "не удалось создать событие сокетов", errcap);
+        return FALSE;
+    }
 
     lwip_init();
 
-    ip4addr_aton(g_cfg.virt_ip, &ip);
-    g_netif_ip = ip;
-    ip4addr_aton(g_cfg.netmask[0] ? g_cfg.netmask : "255.255.255.0", &mask);
-    ip4_addr_set_zero(&gw);
-
-    if (!netif_add(&g_netif, &ip, &mask, &gw, NULL, netif_init_cb, ethernet_input)) {
-        if (err) ml_strlcpy(err, "не удалось создать netif", errcap);
-        tap_close(g_tap); g_tap = INVALID_HANDLE_VALUE;
+    for (i = 0; i < count; i++) {
+        char e[256];
+        if (iface_up(&g_ifaces[g_niface], &cfgs[i], e, sizeof(e))) {
+            ml_log("tunnel[%s]: %s на %s -> SOCKS5 %s:%d",
+                   cfgs[i].label, cfgs[i].virt_ip, cfgs[i].guid,
+                   cfgs[i].proxy_ip, cfgs[i].proxy_port);
+            g_niface++;
+            up++;
+        } else {
+            /* Один занятый адаптер не должен лишать связи остальные. */
+            ml_log("tunnel[%s]: не поднят — %s", cfgs[i].label, e);
+        }
+    }
+    if (!up) {
+        if (err) ml_strlcpy(err, "не удалось поднять ни одного интерфейса", errcap);
         return FALSE;
     }
-    netif_set_default(&g_netif);
-    netif_set_up(&g_netif);
-    netif_set_link_up(&g_netif);
+    netif_set_default(&g_ifaces[0].netif);
 
-    /* Слушатель-ловушка. Порт назначаем любой, а потом обнуляем: ноль —
-     * условная метка «любой порт», её понимает наша правка в tcp_in.c. */
+    /* Слушатель-ловушка один на все интерфейсы: порт 0 — условная метка
+     * «любой порт», её понимает наша правка в tcp_in.c. */
     pcb = tcp_new();
     if (!pcb) { if (err) ml_strlcpy(err, "нет памяти под pcb", errcap); return FALSE; }
     tcp_bind(pcb, IP_ANY_TYPE, 9);
@@ -800,20 +881,14 @@ BOOL tunnel_start(const TunnelCfg *cfg, char *err, size_t errcap)
     g_listener->local_port = 0;
     tcp_accept(g_listener, lw_accept);
 
-    /* DNS: udp_input сопоставляет pcb по порту, а адрес у нас уже принят
-     * флагом ACCEPT_ANY — поэтому один pcb на порту 53 ловит запросы к любому
-     * адресу, и патчить lwIP ради UDP не требуется. */
+    /* DNS: udp_input сопоставляет pcb по порту, а адрес уже принят флагом
+     * ACCEPT_ANY — один pcb на порту 53 ловит запросы со всех интерфейсов. */
     g_udp = udp_new();
     if (g_udp) {
         udp_bind(g_udp, IP_ANY_TYPE, 53);
         udp_recv(g_udp, dns_on_query, NULL);
     }
 
-    g_sock_ev = WSACreateEvent();
-    if (g_sock_ev == WSA_INVALID_EVENT) {
-        if (err) ml_strlcpy(err, "не удалось создать событие сокетов", errcap);
-        return FALSE;
-    }
     g_stop = 0;
     g_stop_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
     g_thread  = CreateThread(NULL, 0, loop_thread, NULL, 0, NULL);
@@ -822,20 +897,30 @@ BOOL tunnel_start(const TunnelCfg *cfg, char *err, size_t errcap)
         return FALSE;
     }
 
-    ml_log("tunnel: %s on %s -> SOCKS5 %s:%d",
-           g_cfg.virt_ip, g_cfg.guid, g_cfg.proxy_ip, g_cfg.proxy_port);
+    ml_log("tunnel: поднято интерфейсов %d из %d", up, count);
     return TRUE;
 }
 
+int tunnel_iface_count(void) { return g_niface; }
+
 void tunnel_stop(void)
 {
+    int i;
     if (!g_thread) return;
     InterlockedExchange(&g_stop, 1);
     if (g_stop_ev) SetEvent(g_stop_ev);      /* будим петлю, а не ждём таймаута */
     WaitForSingleObject(g_thread, 5000);
     CloseHandle(g_thread);
     g_thread = NULL;
+
+    for (i = 0; i < g_niface; i++) {
+        Iface *f = &g_ifaces[i];
+        if (f->ov.hEvent) { CloseHandle(f->ov.hEvent); f->ov.hEvent = NULL; }
+        if (f->tap != INVALID_HANDLE_VALUE) { tap_close(f->tap); f->tap = INVALID_HANDLE_VALUE; }
+        f->used = FALSE;
+    }
+    g_niface = 0;
+
     if (g_stop_ev) { CloseHandle(g_stop_ev); g_stop_ev = NULL; }
     if (g_sock_ev != WSA_INVALID_EVENT) { WSACloseEvent(g_sock_ev); g_sock_ev = WSA_INVALID_EVENT; }
-    if (g_tap != INVALID_HANDLE_VALUE) { tap_close(g_tap); g_tap = INVALID_HANDLE_VALUE; }
 }
