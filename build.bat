@@ -72,12 +72,13 @@ cl.exe /nologo /W3 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS
    /Isrc /Isrc\lwip_port /Ithird_party\lwip\src\include ^
    /Fobuild\agent\ /Fdbuild\agent\ ^
    src\agent_main.c src\util.c src\json.c src\socks5.c src\mediator.c src\httprw.c ^
-   src\tap.c src\tunnel.c src\lwip_port\sys_arch.c ^
+   src\tap.c src\tunnel.c src\winnet.c src\lwip_port\sys_arch.c ^
    third_party\lwip\src\core\*.c ^
    third_party\lwip\src\core\ipv4\*.c ^
    third_party\lwip\src\netif\ethernet.c ^
    /link /SUBSYSTEM:CONSOLE /OUT:build\modlink-agent.exe ^
-   ws2_32.lib advapi32.lib shell32.lib ole32.lib winhttp.lib user32.lib
+   ws2_32.lib advapi32.lib shell32.lib ole32.lib winhttp.lib user32.lib ^
+   setupapi.lib newdev.lib cfgmgr32.lib iphlpapi.lib
 
 if errorlevel 1 (
     echo.
