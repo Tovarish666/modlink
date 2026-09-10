@@ -30,6 +30,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item build/modlink.exe        dist/
+          Copy-Item build/modlink-agent.exe  dist/
+          Copy-Item build/tapprobe.exe       dist/
+          Copy-Item probe/README.md          dist/TAPPROBE.md
           Copy-Item THIRD-PARTY.txt          dist/
           Copy-Item README.md                dist/
           Copy-Item res/3proxy.version.txt   dist/ -ErrorAction SilentlyContinue
