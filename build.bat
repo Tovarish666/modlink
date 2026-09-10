@@ -32,15 +32,23 @@ if errorlevel 1 exit /b 1
 
 echo   compiling...
 REM /utf-8 matters: the sources carry Cyrillic inside L"" literals.
+REM modlink.exe — один exe, два режима: сервер (ui_main) и агент (ui_agent).
+REM Поэтому в него линкуется и агентская связка с lwIP.
 cl.exe /nologo /W3 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
    /D_WINSOCK_DEPRECATED_NO_WARNINGS ^
-   /Isrc /Fobuild\ /Fdbuild\ ^
+   /Isrc /Isrc\lwip_port /Ithird_party\lwip\src\include /Fobuild\ /Fdbuild\ ^
    src\main.c src\util.c src\json.c src\config.c src\proxy3.c ^
    src\net.c src\hilink.c src\reconn.c src\ui_theme.c src\ui_main.c ^
+   src\ui_agent.c src\agentcfg.c src\socks5.c src\mediator.c src\httprw.c ^
+   src\tap.c src\tunnel.c src\winnet.c src\lwip_port\sys_arch.c ^
+   third_party\lwip\src\core\*.c ^
+   third_party\lwip\src\core\ipv4\*.c ^
+   third_party\lwip\src\netif\ethernet.c ^
    build\modlink.res ^
    /link /SUBSYSTEM:WINDOWS /OUT:build\modlink.exe ^
    user32.lib gdi32.lib comctl32.lib shell32.lib ole32.lib ^
-   winhttp.lib ws2_32.lib dwmapi.lib uxtheme.lib advapi32.lib
+   winhttp.lib ws2_32.lib dwmapi.lib uxtheme.lib advapi32.lib ^
+   setupapi.lib newdev.lib cfgmgr32.lib iphlpapi.lib
 
 if errorlevel 1 (
     echo.
@@ -72,6 +80,7 @@ cl.exe /nologo /W3 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS
    /Isrc /Isrc\lwip_port /Ithird_party\lwip\src\include ^
    /Fobuild\agent\ /Fdbuild\agent\ ^
    src\agent_main.c src\util.c src\json.c src\socks5.c src\mediator.c src\httprw.c ^
+   src\agentcfg.c ^
    src\tap.c src\tunnel.c src\winnet.c src\lwip_port\sys_arch.c ^
    third_party\lwip\src\core\*.c ^
    third_party\lwip\src\core\ipv4\*.c ^

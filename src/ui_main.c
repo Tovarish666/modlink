@@ -31,7 +31,7 @@ enum { MODE_WIDE, MODE_MID, MODE_NARROW };
 /* ------------------------------------------------------------- ids */
 enum {
     IDC_WANIP = 100, IDC_WANAUTO, IDC_LANIP, IDC_LANAUTO, IDC_BASEPORT,
-    IDC_ADD, IDC_APPLY, IDC_COPY, IDC_LOGS, IDC_LIST,
+    IDC_ADD, IDC_APPLY, IDC_COPY, IDC_LOGS, IDC_LIST, IDC_AGENT,
 
     IDC_R_EN = 200, IDC_R_NAME, IDC_R_LOGIN, IDC_R_PASS, IDC_R_GEN,
     IDC_R_PORT, IDC_R_LANIP, IDC_R_MODEMIP, IDC_R_RPORT, IDC_R_INT,
@@ -59,7 +59,7 @@ static Config    g_cfg;
 static HINSTANCE g_inst;
 static HWND      g_main, g_list;
 static HWND      g_wanip, g_lanip, g_baseport;
-static HWND      g_btn_wanauto, g_btn_lanauto, g_btn_add, g_btn_apply, g_btn_copy, g_btn_logs;
+static HWND      g_btn_wanauto, g_btn_lanauto, g_btn_add, g_btn_apply, g_btn_copy, g_btn_logs, g_btn_agent;
 static HWND      g_rows[ML_MAX_MODEMS];
 static int       g_nrows = 0;
 static int       g_mode = MODE_WIDE;
@@ -886,7 +886,8 @@ static void relayout(void)
     y = rc.bottom - S(TOOL_H) - S(STATUS_H) + (S(TOOL_H) - bh) / 2;
     x = S(12);
     MoveWindow(g_btn_add,  x, y, bw, bh, TRUE); x += bw + gap;
-    MoveWindow(g_btn_logs, x, y, bw, bh, TRUE);
+    MoveWindow(g_btn_logs, x, y, bw, bh, TRUE); x += bw + gap;
+    MoveWindow(g_btn_agent, x, y, bw, bh, TRUE);
 
     x = w - S(12) - bw;
     MoveWindow(g_btn_apply, x, y, bw, bh, TRUE); x -= bw + gap;
@@ -1020,6 +1021,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         g_btn_lanauto = btn_create(h, L"Авто", IDC_LANAUTO, BTN_NORMAL);
         g_btn_add     = btn_create(h, L"+ Добавить",  IDC_ADD,   BTN_NORMAL);
         g_btn_logs    = btn_create(h, L"Логи 3proxy", IDC_LOGS,  BTN_NORMAL);
+        g_btn_agent   = btn_create(h, L"Агент \x25b8",  IDC_AGENT, BTN_NORMAL);
         g_btn_copy    = btn_create(h, L"Копировать",  IDC_COPY,  BTN_NORMAL);
         g_btn_apply   = btn_create(h, L"Применить",   IDC_APPLY, BTN_PRIMARY);
 
@@ -1181,6 +1183,20 @@ static LRESULT CALLBACK MainProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_APPLY: action_apply(); return 0;
         case IDC_COPY:  do_copy_credentials(); return 0;
         case IDC_LOGS:  log_show(-1, "Лог 3proxy"); return 0;
+        case IDC_AGENT: {
+            /* Режим агента требует прав администратора — перезапускаем себя с
+             * повышением. Серверная панель остаётся работать, они не мешают
+             * друг другу (разные мьютексы, разные окна). */
+            char self[ML_PATH_LEN];
+            if (GetModuleFileNameA(NULL, self, sizeof(self))) {
+                SHELLEXECUTEINFOA sei; memset(&sei, 0, sizeof(sei));
+                sei.cbSize = sizeof(sei); sei.lpVerb = "runas";
+                sei.lpFile = self; sei.lpParameters = "--agent"; sei.nShow = SW_SHOWNORMAL;
+                if (!ShellExecuteExA(&sei))
+                    status_set("не удалось запустить режим агента", C_ERROR);
+            }
+            return 0;
+        }
 
         case IDC_WANAUTO:
             EnableWindow(g_btn_wanauto, FALSE);
