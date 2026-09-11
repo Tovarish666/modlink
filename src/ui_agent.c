@@ -318,11 +318,23 @@ static DWORD WINAPI apply_thread(LPVOID arg)
         snprintf(host_ip, sizeof(host_ip), "192.168.%d.100", n);
         snprintf(virt,    sizeof(virt),    "192.168.%d.1",   n);
 
+        /* GUID из конфига мог остаться от удалённого адаптера — проверяем, что
+         * он ещё живой, иначе создаём заново. Без этого «Применить» пытается
+         * поднять туннель на несуществующий адаптер и падает с «не найден». */
+        if (d->guid[0]) {
+            TapAdapter chk;
+            if (!tap_find_by_guid(d->guid, &chk)) d->guid[0] = 0;
+        }
+
         if (!d->guid[0]) {
             char inf[ML_PATH_LEN], mac[16], name[64];
             snprintf(inf, sizeof(inf), "%s\\OemVista.inf", ml_dir_data());
             if (!winnet_create_adapter(inf, d->guid, sizeof(d->guid), err, sizeof(err))) {
-                a_status_post(err, C_ERROR);
+                char m[600];
+                snprintf(m, sizeof(m), "%s%s", err,
+                         strstr(err, "дминистратор") ? "" :
+                         " — запусти modlink от имени администратора");
+                a_status_post(m, C_ERROR);
                 continue;
             }
             snprintf(mac, sizeof(mac), "021E10%02X%02X%02X",
@@ -407,7 +419,12 @@ static void load_rows(void)
         if (row) {
             ARow *r = arow(row);
             char pr[256];
-            ml_strlcpy(r->guid, loaded[i].guid, sizeof(r->guid));
+            {
+                TapAdapter chk;
+                if (loaded[i].guid[0] && tap_find_by_guid(loaded[i].guid, &chk))
+                    ml_strlcpy(r->guid, loaded[i].guid, sizeof(r->guid));
+                /* иначе оставляем guid пустым — адаптера нет, строка новая */
+            }
             edit_set(r->name, loaded[i].label);
             edit_set(r->real, loaded[i].real_ip);
             snprintf(pr, sizeof(pr), "%s:%d:%s:%s",

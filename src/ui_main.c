@@ -281,7 +281,16 @@ static void row_store(HWND row, Modem *m)
     edit_get(d->login,   m->login,    sizeof(m->login));
     edit_get(d->pass,    m->pass,     sizeof(m->pass));
     edit_get(d->lanip,   m->lan_ip,   sizeof(m->lan_ip));
-    edit_get(d->modemip, m->modem_ip, sizeof(m->modem_ip));
+    /* «IP модема» (веб-морда Huawei) больше не колонка — берём из подсети
+     * LAN IP (-e): 192.168.N.100 -> 192.168.N.1. Именно так она и адресуется. */
+    {
+        char lan[ML_ADDR_LEN]; int a,b,c,dd;
+        edit_get(d->lanip, lan, sizeof(lan));
+        if (sscanf(lan, "%d.%d.%d.%d", &a,&b,&c,&dd) == 4)
+            snprintf(m->modem_ip, sizeof(m->modem_ip), "%d.%d.%d.1", a,b,c);
+        else
+            m->modem_ip[0] = 0;
+    }
     m->proxy_port   = edit_get_int(d->port);
     m->reconn_port  = edit_get_int(d->rport);
     m->interval_min = edit_get_int(d->intv);
@@ -312,8 +321,7 @@ static void row_layout(HWND row)
         flex_reset(&L);
         flex_add(&L, d->en,      26,  0, 0);
         flex_add(&L, d->num,     44,  0, 0);
-        flex_add(&L, d->modemip,108,  1, 0);
-        flex_add(&L, d->lanip,  108,  1, 0);
+        flex_add(&L, d->lanip,  120,  1, 0);
         flex_add(&L, d->port,    58,  0, 0);
         flex_add(&L, d->login,   92,  1, 0);
         flex_add(&L, d->pass,   104,  1, 0);
@@ -321,8 +329,7 @@ static void row_layout(HWND row)
         flex_add(&L, d->rport,   58,  0, 0);
         flex_add(&L, d->intv,    46,  0, 0);
         /* Weight 2: the exit IP is what gets read after every reconnect, so
-         * spare width goes here first. A v4 address plus the Huawei marker
-         * needs ~150dp before it starts eliding. */
+         * spare width goes here first. */
         flex_add(&L, NULL,      150,  2, 0);
         flex_add(&L, d->test,    56,  0, 0);
         flex_add(&L, d->reconn,  26,  0, 0);
@@ -334,8 +341,7 @@ static void row_layout(HWND row)
         flex_reset(&L);
         flex_add(&L, d->en,      26,  0, 0);
         flex_add(&L, d->num,     44,  0, 0);
-        flex_add(&L, d->modemip,108,  1, 0);
-        flex_add(&L, d->lanip,  108,  1, 0);
+        flex_add(&L, d->lanip,  120,  1, 0);
         flex_add(&L, d->port,    58,  0, 0);
         flex_add(&L, d->login,   92,  1, 0);
         y = flex_apply(&L, x, y, w, lh, ROW_GAP) + S(ROW_GAP);
@@ -362,8 +368,7 @@ static void row_layout(HWND row)
         y = flex_apply(&L, x, y, w, lh, ROW_GAP) + S(ROW_GAP);
 
         flex_reset(&L);
-        flex_add(&L, d->modemip, 96,  1, 0);
-        flex_add(&L, d->lanip,   96,  1, 0);
+        flex_add(&L, d->lanip,  120,  1, 0);
         y = flex_apply(&L, x, y, w, lh, ROW_GAP) + S(ROW_GAP);
 
         flex_reset(&L);
@@ -438,6 +443,7 @@ static LRESULT CALLBACK RowProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         nd->port    = edit_create(h, IDC_R_PORT,    TRUE,  FALSE);
         nd->lanip   = edit_create(h, IDC_R_LANIP,   TRUE,  FALSE);
         nd->modemip = edit_create(h, IDC_R_MODEMIP, TRUE,  FALSE);
+        ShowWindow(nd->modemip, SW_HIDE);  /* колонка убрана; адрес морды берём из LAN IP */
         nd->rport   = edit_create(h, IDC_R_RPORT,   TRUE,  FALSE);
         nd->intv    = edit_create(h, IDC_R_INT,     TRUE,  FALSE);
         nd->test    = btn_create(h, L"Test",   IDC_R_TEST,   BTN_NORMAL);
@@ -1018,25 +1024,25 @@ static void paint_main(HWND h, HDC dc)
     /* --- column header (wide mode only) --- */
     if (g_mode == MODE_WIDE) {
         /* Must mirror the WIDE flex line in row_layout() exactly. */
-        static const wchar_t *H[] = { L"", L"№", L"IP МОДЕМА", L"LAN IP (-e)", L"ПОРТ",
+        static const wchar_t *H[] = { L"", L"№", L"LAN IP (-e)", L"ПОРТ",
                                       L"ЛОГИН", L"ПАРОЛЬ", L"", L"РЕК.ПОРТ", L"ИНТ",
                                       L"ТЕСТ", L"", L"", L"", L"", L"" };
-        static const int W[] = { 26, 44, 108, 108, 58, 92, 104, 26, 58, 46, 150, 56, 26, 26, 26, 26 };
-        static const int F[] = {  0,  0,   1,   1,  0,  1,   1,  0,  0,  0,   2,  0,  0,  0,  0,  0 };
+        static const int W[] = { 26, 44, 120, 58, 92, 104, 26, 58, 46, 150, 56, 26, 26, 26, 26 };
+        static const int F[] = {  0,  0,   1,  0,  1,   1,  0,  0,  0,   2,  0,  0,  0,  0,  0 };
         int i, total_min = 0, weight = 0, avail, leftover, cx;
 
         r = rc; r.top = y; r.bottom = y + S(COLHDR_H);
         theme_fill(dc, &r, g_th.br_bg);
         { RECT ln = r; ln.top = ln.bottom - 1; theme_fill(dc, &ln, g_th.br_border); }
 
-        for (i = 0; i < 16; i++) { total_min += S(W[i]); weight += F[i]; }
-        total_min += S(ROW_GAP) * 15;
+        for (i = 0; i < 15; i++) { total_min += S(W[i]); weight += F[i]; }
+        total_min += S(ROW_GAP) * 14;
         avail = rc.right - S(ROW_PAD) * 2;
         leftover = avail - total_min;
         if (leftover < 0) leftover = 0;
 
         cx = S(ROW_PAD);
-        for (i = 0; i < 16; i++) {
+        for (i = 0; i < 15; i++) {
             int cw = S(W[i]) + (F[i] && weight ? leftover * F[i] / weight : 0);
             if (H[i][0]) {
                 RECT cr = r;
