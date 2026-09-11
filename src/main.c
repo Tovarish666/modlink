@@ -1,26 +1,19 @@
-/* modlink — точка входа. Два режима в одном exe:
- *   без аргументов  — панель сервера (3proxy, модемы);
- *   --agent         — панель агента (виртуальные модемы на этой машине).
- * Агенту нужны права администратора; если их нет, перезапускаем себя с
- * повышением. Сервер прав не требует и остаётся asInvoker. */
+/* modlink — точка входа. Одно окно, две вкладки: «Сервер» и «Агент».
+ * Серверу права администратора не нужны; агенту (создание адаптеров, реестр)
+ * нужны. Поэтому запуск с --agent сразу открывает вкладку агента и, если прав
+ * нет, перезапускает себя с повышением. Обычный запуск — вкладка сервера без
+ * повышения; переключиться на агента можно и там, но операции с адаптерами
+ * попросят администратора. */
 #include "common.h"
 #include "ui.h"
 #include <winsock2.h>
 #include <shellapi.h>
 
-int ui_agent_run(HINSTANCE hInst, int nCmdShow);
-
-static BOOL is_agent(LPSTR cmd)
-{
-    return cmd && strstr(cmd, "--agent") != NULL;
-}
+extern int g_start_agent;   /* из ui_main: стартовать на вкладке агента */
 
 static BOOL is_elevated(void)
 {
-    HANDLE tok = NULL;
-    TOKEN_ELEVATION el;
-    DWORD len = 0;
-    BOOL r = FALSE;
+    HANDLE tok = NULL; TOKEN_ELEVATION el; DWORD len = 0; BOOL r = FALSE;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
         if (GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &len))
             r = el.TokenIsElevated != 0;
@@ -29,7 +22,6 @@ static BOOL is_elevated(void)
     return r;
 }
 
-/* Перезапуск себя с запросом прав администратора (диалог UAC). */
 static BOOL relaunch_elevated(const char *args)
 {
     char self[ML_PATH_LEN];
@@ -37,25 +29,19 @@ static BOOL relaunch_elevated(const char *args)
     if (!GetModuleFileNameA(NULL, self, sizeof(self))) return FALSE;
     memset(&sei, 0, sizeof(sei));
     sei.cbSize = sizeof(sei);
-    sei.lpVerb = "runas";              /* просит повышение */
+    sei.lpVerb = "runas";
     sei.lpFile = self;
     sei.lpParameters = args;
     sei.nShow = SW_SHOWNORMAL;
     return ShellExecuteExA(&sei);
 }
 
-/* Второй экземпляр того же режима не нужен — поднимаем окно первого. */
-static BOOL already_running(BOOL agent)
+static BOOL already_running(void)
 {
-    const char *name = agent ? "Global\\modlink_agent_instance"
-                             : "Global\\modlink_server_instance";
-    HANDLE mtx = CreateMutexA(NULL, TRUE, name);
+    HANDLE mtx = CreateMutexA(NULL, TRUE, "Global\\modlink_single_instance");
     if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND prev = FindWindowW(agent ? L"ModlinkAgent" : L"ModlinkMain", NULL);
-        if (prev) {
-            if (IsIconic(prev)) ShowWindow(prev, SW_RESTORE);
-            SetForegroundWindow(prev);
-        }
+        HWND prev = FindWindowW(L"ModlinkMain", NULL);
+        if (prev) { if (IsIconic(prev)) ShowWindow(prev, SW_RESTORE); SetForegroundWindow(prev); }
         return TRUE;
     }
     return FALSE;
@@ -64,13 +50,11 @@ static BOOL already_running(BOOL agent)
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nCmdShow)
 {
     WSADATA wsa;
-    BOOL agent;
+    BOOL agent = cmd && strstr(cmd, "--agent") != NULL;
     int rc;
-
     (void)hPrev;
-    agent = is_agent(cmd);
 
-    /* Агент без прав — перезапускаемся с повышением и выходим. */
+    /* Запуск с --agent без прав — перезапускаемся с повышением. */
     if (agent && !is_elevated()) {
         if (relaunch_elevated("--agent")) return 0;
         MessageBoxW(NULL, L"Режим агента требует прав администратора.",
@@ -78,7 +62,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nCmdShow)
         return 1;
     }
 
-    if (already_running(agent)) return 0;
+    if (already_running()) return 0;
 
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         MessageBoxW(NULL, L"Не удалось инициализировать Winsock.", L"modlink",
@@ -87,14 +71,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nCmdShow)
     }
 
     ml_ensure_dirs();
-    ml_log(agent ? "---- modlink agent starting ----" : "---- modlink server starting ----");
+    ml_log("---- modlink starting ----");
+    if (agent) g_start_agent = 1;
 
-    if (agent) {
-        rc = ui_agent_run(hInst, nCmdShow);
-    } else {
-        p3_extract_binary();
-        rc = ui_run(hInst, nCmdShow);
-    }
+    /* 3proxy распаковываем только под сервер; агенту он не нужен. */
+    if (!agent) p3_extract_binary();
+
+    rc = ui_run(hInst, nCmdShow);
 
     ml_log("---- modlink exiting ----");
     WSACleanup();

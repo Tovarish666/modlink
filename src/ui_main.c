@@ -31,7 +31,7 @@ enum { MODE_WIDE, MODE_MID, MODE_NARROW };
 /* ------------------------------------------------------------- ids */
 enum {
     IDC_WANIP = 100, IDC_WANAUTO, IDC_LANIP, IDC_LANAUTO, IDC_BASEPORT,
-    IDC_ADD, IDC_APPLY, IDC_COPY, IDC_LOGS, IDC_LIST, IDC_AGENT,
+    IDC_ADD, IDC_APPLY, IDC_COPY, IDC_LOGS, IDC_LIST, IDC_TAB_SRV, IDC_TAB_AGENT,
 
     IDC_R_EN = 200, IDC_R_NAME, IDC_R_LOGIN, IDC_R_PASS, IDC_R_GEN,
     IDC_R_PORT, IDC_R_LANIP, IDC_R_MODEMIP, IDC_R_RPORT, IDC_R_INT,
@@ -59,7 +59,7 @@ static Config    g_cfg;
 static HINSTANCE g_inst;
 static HWND      g_main, g_list;
 static HWND      g_wanip, g_lanip, g_baseport;
-static HWND      g_btn_wanauto, g_btn_lanauto, g_btn_add, g_btn_apply, g_btn_copy, g_btn_logs, g_btn_agent;
+static HWND      g_btn_wanauto, g_btn_lanauto, g_btn_add, g_btn_apply, g_btn_copy, g_btn_logs;
 static HWND      g_rows[ML_MAX_MODEMS];
 static int       g_nrows = 0;
 static int       g_mode = MODE_WIDE;
@@ -68,7 +68,32 @@ static char      g_status[512] = "готов";
 static COLORREF  g_status_col;
 static volatile LONG g_busy = 0;
 
+void  ui_agent_register(HINSTANCE inst);
+HWND  ui_agent_create(HWND parent);
+void  ui_agent_stop_all(void);
+int   agent_is_running(void);
+
+/* Оболочка: одно окно, две вкладки. Серверные контролы и дочерний вид агента
+ * живут в одном окне; переключение прячет один набор и показывает другой. */
+enum { TAB_SERVER = 0, TAB_AGENT };
+static int   g_tab = TAB_SERVER;
+static HWND  g_agentview = NULL;
+static HWND  g_tab_srv = NULL, g_tab_agent = NULL;
+int          g_start_agent = 0;   /* выставляется из main при запуске с --agent */
+
+static BOOL shell_is_elevated(void)
+{
+    HANDLE tok = NULL; TOKEN_ELEVATION el; DWORD len = 0; BOOL r = FALSE;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        if (GetTokenInformation(tok, TokenElevation, &el, sizeof(el), &len))
+            r = el.TokenIsElevated != 0;
+        CloseHandle(tok);
+    }
+    return r;
+}
+
 static void relayout(void);
+static void switch_tab(int t);
 static void rows_rebuild(void);
 static void collect_ui_into_config(void);
 
@@ -841,6 +866,30 @@ static void action_apply(void)
 }
 
 /* ------------------------------------------------------------- main layout */
+/* Показать/скрыть весь серверный набор контролов. Строки списка — дети g_list,
+ * так что скрытие самого списка прячет и их. */
+static void server_show(BOOL v)
+{
+    HWND set[] = { g_wanip, g_lanip, g_baseport, g_btn_wanauto, g_btn_lanauto,
+                   g_list, g_btn_add, g_btn_logs, g_btn_copy, g_btn_apply };
+    int i;
+    for (i = 0; i < (int)(sizeof(set)/sizeof(set[0])); i++)
+        if (set[i]) ShowWindow(set[i], v ? SW_SHOW : SW_HIDE);
+}
+
+static void switch_tab(int t)
+{
+    g_tab = t;
+    SetWindowLongPtrW(g_tab_srv,   GWLP_USERDATA, t == TAB_SERVER ? BTN_PRIMARY : BTN_NORMAL);
+    SetWindowLongPtrW(g_tab_agent, GWLP_USERDATA, t == TAB_AGENT  ? BTN_PRIMARY : BTN_NORMAL);
+    server_show(t == TAB_SERVER);
+    if (g_agentview) ShowWindow(g_agentview, t == TAB_AGENT ? SW_SHOW : SW_HIDE);
+    if (t == TAB_AGENT && !shell_is_elevated())
+        status_set("режим агента: операции с адаптерами требуют прав администратора", C_WARN);
+    relayout();
+    InvalidateRect(g_main, NULL, TRUE);
+}
+
 static void relayout(void)
 {
     RECT rc;
@@ -851,6 +900,19 @@ static void relayout(void)
     if (!g_main) return;
     GetClientRect(g_main, &rc);
     w = rc.right - rc.left;
+
+    /* вкладки в шапке — всегда */
+    {
+        int tabw = S(84), tabh = S(26), ty = (S(HDR_H) - tabh) / 2, tx = S(150);
+        if (g_tab_srv)   MoveWindow(g_tab_srv,   tx,             ty, tabw, tabh, TRUE);
+        if (g_tab_agent) MoveWindow(g_tab_agent, tx + tabw + S(6), ty, tabw, tabh, TRUE);
+    }
+
+    /* вкладка агента: дочерний вид заполняет всё под шапкой, серверная раскладка не нужна */
+    if (g_tab == TAB_AGENT) {
+        if (g_agentview) MoveWindow(g_agentview, 0, S(HDR_H), w, rc.bottom - S(HDR_H), TRUE);
+        return;
+    }
 
     /* The breakpoint check is the whole adaptive story: pick a mode from the
      * width, and every row reflows itself when it changes. */
@@ -886,8 +948,7 @@ static void relayout(void)
     y = rc.bottom - S(TOOL_H) - S(STATUS_H) + (S(TOOL_H) - bh) / 2;
     x = S(12);
     MoveWindow(g_btn_add,  x, y, bw, bh, TRUE); x += bw + gap;
-    MoveWindow(g_btn_logs, x, y, bw, bh, TRUE); x += bw + gap;
-    MoveWindow(g_btn_agent, x, y, bw, bh, TRUE);
+    MoveWindow(g_btn_logs, x, y, bw, bh, TRUE);
 
     x = w - S(12) - bw;
     MoveWindow(g_btn_apply, x, y, bw, bh, TRUE); x -= bw + gap;
@@ -916,17 +977,23 @@ static void paint_main(HWND h, HDC dc)
     theme_fill(dc, &r, g_th.br_surface);
     { RECT ln = r; ln.top = ln.bottom - 1; theme_fill(dc, &ln, g_th.br_border); }
 
-    r.left = S(14); r.right = S(240);
+    r.left = S(14); r.right = S(140);
     theme_text(dc, &r, L"modlink", g_th.f_title, C_WHITE, DT_VCENTER | DT_SINGLELINE);
-    r.left = S(14) + S(78);
-    theme_text(dc, &r, L"server", g_th.f_ui, C_MUTED, DT_VCENTER | DT_SINGLELINE);
 
     /* status chips, right-aligned */
-    r = rc; r.bottom = S(HDR_H); r.right -= S(14); r.left = r.right - S(150);
-    _snwprintf(buf, 255, L"%s  %d модем(ов)",
-               running ? L"\x25cf active" : L"\x25cf stopped", g_cfg.count);
-    theme_text(dc, &r, buf, g_th.f_ui, running ? C_SUCCESS : C_MUTED,
+    r = rc; r.bottom = S(HDR_H); r.right -= S(14); r.left = r.right - S(180);
+    if (g_tab == TAB_SERVER)
+        _snwprintf(buf, 255, L"%s  %d модем(ов)",
+                   running ? L"\x25cf active" : L"\x25cf stopped", g_cfg.count);
+    else
+        _snwprintf(buf, 255, L"%s",
+                   agent_is_running() ? L"\x25cf агент работает" : L"\x25cf агент остановлен");
+    theme_text(dc, &r, buf, g_th.f_ui,
+               (g_tab == TAB_SERVER ? running : agent_is_running()) ? C_SUCCESS : C_MUTED,
                DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+    /* на вкладке агента остальное рисует дочерний вид */
+    if (g_tab == TAB_AGENT) return;
 
     /* --- config bar labels --- */
     y = S(HDR_H);
@@ -1021,7 +1088,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         g_btn_lanauto = btn_create(h, L"Авто", IDC_LANAUTO, BTN_NORMAL);
         g_btn_add     = btn_create(h, L"+ Добавить",  IDC_ADD,   BTN_NORMAL);
         g_btn_logs    = btn_create(h, L"Логи 3proxy", IDC_LOGS,  BTN_NORMAL);
-        g_btn_agent   = btn_create(h, L"Агент \x25b8",  IDC_AGENT, BTN_NORMAL);
+        /* вкладки в шапке */
+        g_tab_srv   = btn_create(h, L"Сервер", IDC_TAB_SRV,   BTN_PRIMARY);
+        g_tab_agent = btn_create(h, L"Агент",  IDC_TAB_AGENT, BTN_NORMAL);
+        /* дочерний вид агента, скрыт до переключения */
+        ui_agent_register(g_inst);
+        g_agentview = ui_agent_create(h);
         g_btn_copy    = btn_create(h, L"Копировать",  IDC_COPY,  BTN_NORMAL);
         g_btn_apply   = btn_create(h, L"Применить",   IDC_APPLY, BTN_PRIMARY);
 
@@ -1183,20 +1255,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_APPLY: action_apply(); return 0;
         case IDC_COPY:  do_copy_credentials(); return 0;
         case IDC_LOGS:  log_show(-1, "Лог 3proxy"); return 0;
-        case IDC_AGENT: {
-            /* Режим агента требует прав администратора — перезапускаем себя с
-             * повышением. Серверная панель остаётся работать, они не мешают
-             * друг другу (разные мьютексы, разные окна). */
-            char self[ML_PATH_LEN];
-            if (GetModuleFileNameA(NULL, self, sizeof(self))) {
-                SHELLEXECUTEINFOA sei; memset(&sei, 0, sizeof(sei));
-                sei.cbSize = sizeof(sei); sei.lpVerb = "runas";
-                sei.lpFile = self; sei.lpParameters = "--agent"; sei.nShow = SW_SHOWNORMAL;
-                if (!ShellExecuteExA(&sei))
-                    status_set("не удалось запустить режим агента", C_ERROR);
-            }
-            return 0;
-        }
+        case IDC_TAB_SRV:   switch_tab(TAB_SERVER); return 0;
+        case IDC_TAB_AGENT: switch_tab(TAB_AGENT);  return 0;
 
         case IDC_WANAUTO:
             EnableWindow(g_btn_wanauto, FALSE);
@@ -1297,6 +1357,7 @@ int ui_run(HINSTANCE hInst, int nCmdShow)
     rows_rebuild();
     relayout();
     ShowWindow(hwnd, nCmdShow);
+    if (g_start_agent) switch_tab(TAB_AGENT);
     UpdateWindow(hwnd);
 
     /* Bring the proxy up with whatever was last saved, so a restart of the app

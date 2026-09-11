@@ -27,6 +27,24 @@ static BOOL reg_set_sz(HKEY root, const char *path, const char *name, const char
     return r == ERROR_SUCCESS;
 }
 
+/* Кириллицу в реестр — только широкой строкой: REG_SZ хранит UTF-16, а запись
+ * UTF-8 байтами Windows потом читает как ANSI и показывает кашу (это и была
+ * «хрень» в именах сетевых подключений). */
+static BOOL reg_set_wsz(HKEY root, const char *path, const char *name, const char *utf8)
+{
+    HKEY k;
+    wchar_t *wname = ml_utf8_to_w(name);
+    wchar_t *wval  = ml_utf8_to_w(utf8);
+    LONG r = ERROR_INVALID_PARAMETER;
+    if (wname && wval && RegOpenKeyExA(root, path, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+        r = RegSetValueExW(k, wname, 0, REG_SZ, (const BYTE *)wval,
+                           (DWORD)((wcslen(wval) + 1) * sizeof(wchar_t)));
+        RegCloseKey(k);
+    }
+    free(wname); free(wval);
+    return r == ERROR_SUCCESS;
+}
+
 static BOOL reg_get_sz(HKEY root, const char *path, const char *name, char *out, DWORD cap)
 {
     HKEY k;
@@ -400,14 +418,18 @@ BOOL winnet_configure(const char *guid, const char *ip, int prefix,
 }
 
 /* ------------------------------------------------------------- имя */
+/* Имя подключения (NetConnectionID) в «Сетевых подключениях». Пишем широкой
+ * строкой — это и был фикс «хрени»: раньше UTF-8 байты читались как ANSI.
+ * Живое применение имени Windows делает лениво (перечисление/перезагрузка);
+ * маскировка, которую читают инструменты (описание, производитель, MAC),
+ * применяется сразу при cycle. */
 BOOL winnet_rename(const char *guid, const char *new_name, char *err, size_t errcap)
 {
-    /* Имя (NetConnectionID) лежит в …\Network\{класс}\{guid}\Connection\Name. */
     char path[400];
     if (err && errcap) err[0] = 0;
     snprintf(path, sizeof(path),
         "SYSTEM\\CurrentControlSet\\Control\\Network\\" NET_CLASS_GUID "\\%s\\Connection", guid);
-    if (!reg_set_sz(HKEY_LOCAL_MACHINE, path, "Name", new_name)) {
+    if (!reg_set_wsz(HKEY_LOCAL_MACHINE, path, "Name", new_name)) {
         if (err) snprintf(err, errcap, "не удалось переименовать %s", guid);
         return FALSE;
     }
