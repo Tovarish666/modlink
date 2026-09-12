@@ -302,6 +302,16 @@ static BOOL arow_to_cfg(HWND row, TunnelCfg *t)
 }
 
 /* ------------------------------------------------------------- применение */
+/* Профиль сети переименовываем с задержкой: Windows опознаёт сеть только после
+ * того, как через туннель пойдёт трафик, и лишь тогда у профиля появляется имя
+ * адаптера, по которому мы его находим. */
+static DWORD WINAPI netname_thread(LPVOID arg)
+{
+    (void)arg;
+    Sleep(12000);
+    winnet_normalize_network_names("\xd0\xa1\xd0\xb5\xd1\x82\xd1\x8c 3");  /* «Сеть 3» */
+    return 0;
+}
 static DWORD WINAPI apply_thread(LPVOID arg)
 {
     int i, made = 0;
@@ -387,6 +397,8 @@ static DWORD WINAPI apply_thread(LPVOID arg)
                     snprintf(msg, sizeof(msg), "применено: интерфейсов %d, создано новых %d",
                              tunnel_iface_count(), made);
                 a_status_post(msg, bad >= 0 ? C_WARN : C_SUCCESS);
+                /* привести «Состояние» к «Сеть N» после опознания сети */
+                CloseHandle(CreateThread(NULL, 0, netname_thread, NULL, 0, NULL));
             } else { g_running = FALSE; a_status_post(err, C_ERROR); }
         } else {
             a_status_post("нет готовых строк — заполни номер и прокси", C_WARN);

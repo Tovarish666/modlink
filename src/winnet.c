@@ -440,6 +440,64 @@ BOOL winnet_configure(const char *guid, const char *ip, int prefix,
 }
 
 /* ------------------------------------------------------------- имя */
+
+/* Запуск PowerShell-скрипта через -EncodedCommand (UTF-16LE + base64). Так
+ * кириллица в скрипте доходит без искажений — CreateProcessA передал бы UTF-8
+ * байты, а PowerShell прочитал бы их как ANSI. */
+static void run_ps_encoded(const char *utf8_script)
+{
+    static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    wchar_t *w = ml_utf8_to_w(utf8_script);
+    int wlen, i, o;
+    unsigned char *bytes;
+    char *b64, *cmd;
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
+    if (!w) return;
+    wlen = (int)wcslen(w);
+    bytes = (unsigned char *)w;                     /* UTF-16LE как есть */
+    {
+        int blen = wlen * 2;
+        int olen = ((blen + 2) / 3) * 4;
+        b64 = (char *)malloc((size_t)olen + 1);
+        if (!b64) { free(w); return; }
+        for (i = 0, o = 0; i < blen; i += 3) {
+            int n = bytes[i] << 16;
+            if (i + 1 < blen) n |= bytes[i+1] << 8;
+            if (i + 2 < blen) n |= bytes[i+2];
+            b64[o++] = B64[(n >> 18) & 63];
+            b64[o++] = B64[(n >> 12) & 63];
+            b64[o++] = (i + 1 < blen) ? B64[(n >> 6) & 63] : '=';
+            b64[o++] = (i + 2 < blen) ? B64[n & 63] : '=';
+        }
+        b64[o] = 0;
+    }
+    free(w);
+    cmd = (char *)malloc(strlen(b64) + 64);
+    if (!cmd) { free(b64); return; }
+    sprintf(cmd, "powershell -NoProfile -NonInteractive -EncodedCommand %s", b64);
+    free(b64);
+    memset(&si,0,sizeof(si)); si.cb=sizeof(si); memset(&pi,0,sizeof(pi));
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 25000);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+    free(cmd);
+}
+
+void winnet_normalize_network_names(const char *net_name)
+{
+    char script[1200];
+    snprintf(script, sizeof(script),
+        "$n='%s'; $b='HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles'; "
+        "Get-NetAdapter -EA 0 | Where-Object MacAddress -like '02-1E-10-*' | ForEach-Object { "
+        "$nm=$_.Name; Get-ChildItem $b -EA 0 | Where-Object { (Get-ItemProperty $_.PSPath -EA 0).ProfileName -eq $nm } | "
+        "ForEach-Object { Set-ItemProperty $_.PSPath -Name ProfileName -Value $n -EA 0; "
+        "Set-ItemProperty $_.PSPath -Name Category -Value 1 -Type DWord -EA 0 } }; "
+        "Restart-Service NlaSvc -Force -EA 0", net_name);
+    run_ps_encoded(script);
+    ml_log("winnet: профиль сети -> «%s» для виртуальных адаптеров", net_name);
+}
+
 void winnet_suppress_network_popup(void)
 {
     /* Само присутствие этого ключа отключает мастер «Расположение в сети»,

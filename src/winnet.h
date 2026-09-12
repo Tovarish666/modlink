@@ -43,4 +43,10 @@ void winnet_suggest_name(char *out, size_t cap);
  * оно крадёт фокус и мигает поверх панели при каждом создании. */
 void winnet_suppress_network_popup(void);
 
+/* Переименовать профиль сети всех наших виртуальных адаптеров (MAC 02-1E-10-*)
+ * в net_name (напр. «Сеть 3»), чтобы в «Сетевых подключениях» они выглядели
+ * как обычная сеть, а не «Ethernet N» / «Подключение по локальной сети N».
+ * Работает только после того, как Windows опознает сеть (пошёл трафик). */
+void winnet_normalize_network_names(const char *net_name);
+
 #endif
