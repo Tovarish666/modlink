@@ -12,6 +12,7 @@
 #include "agentcfg.h"
 #include "tunnel.h"
 #include "winnet.h"
+#include "socks5.h"
 #include "tap.h"
 #include <windowsx.h>
 #include <commctrl.h>
@@ -327,7 +328,7 @@ static DWORD WINAPI apply_thread(LPVOID arg)
         }
 
         if (!d->guid[0]) {
-            char inf[ML_PATH_LEN], mac[16], name[64];
+            char inf[ML_PATH_LEN], mac[16];
             snprintf(inf, sizeof(inf), "%s\\OemVista.inf", ml_dir_data());
             if (!winnet_create_adapter(inf, d->guid, sizeof(d->guid), err, sizeof(err))) {
                 char m[600];
@@ -341,8 +342,9 @@ static DWORD WINAPI apply_thread(LPVOID arg)
                      (n >> 4) & 0xFF, n & 0xFF, (n * 7) & 0xFF);
             winnet_disguise(d->guid, "Remote NDIS based Internet Sharing Device",
                             mac, "Huawei Technologies Co., Ltd.", err, sizeof(err));
-            snprintf(name, sizeof(name), "\xd0\xbc\xd0\xbe\xd0\xb4\xd0\xb5\xd0\xbc""%d", n); /* «модемN» */
-            winnet_rename(d->guid, name, err, sizeof(err));
+            /* Имя подключения не трогаем — Windows назовёт по-своему (Ethernet N),
+             * как обычные адаптеры. Состояние станет «Сеть N» само, когда через
+             * интерфейс пойдёт трафик. */
             winnet_cycle(d->guid, err, sizeof(err));
             made++;
         }
@@ -359,11 +361,29 @@ static DWORD WINAPI apply_thread(LPVOID arg)
         agentcfg_save(agentcfg_path(), list, nlist);
         if (nlist > 0) {
             if (tunnel_start(list, nlist, err, sizeof(err))) {
-                char msg[160];
+                char msg[300];
+                int bad = -1, i2;
                 g_running = TRUE;
-                snprintf(msg, sizeof(msg), "применено: интерфейсов %d, создано новых %d",
-                         tunnel_iface_count(), made);
-                a_status_post(msg, C_SUCCESS);
+                /* Быстрая проверка: каждый прокси должен отвечать по SOCKS5.
+                 * Частая ошибка — вписать порт реконнекта вместо порта прокси;
+                 * тогда рукопожатие возвращает не то, и интернета нет. */
+                for (i2 = 0; i2 < nlist; i2++) {
+                    char e2[128];
+                    SOCKET s2 = socks5_connect(list[i2].proxy_ip, list[i2].proxy_port,
+                                               list[i2].user, list[i2].pass,
+                                               "1.1.1.1", 80, 6000, e2, sizeof(e2));
+                    if (s2 == INVALID_SOCKET) { bad = i2; }
+                    else closesocket(s2);
+                }
+                if (bad >= 0)
+                    snprintf(msg, sizeof(msg),
+                        "интерфейсы подняты, но прокси %s:%d не отвечает по SOCKS5 — "
+                        "проверь порт (нужен «Порт», а не «Рек.порт»)",
+                        list[bad].proxy_ip, list[bad].proxy_port);
+                else
+                    snprintf(msg, sizeof(msg), "применено: интерфейсов %d, создано новых %d",
+                             tunnel_iface_count(), made);
+                a_status_post(msg, bad >= 0 ? C_WARN : C_SUCCESS);
             } else { g_running = FALSE; a_status_post(err, C_ERROR); }
         } else {
             a_status_post("нет готовых строк — заполни номер и прокси", C_WARN);
