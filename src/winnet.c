@@ -356,6 +356,28 @@ BOOL winnet_configure(const char *guid, const char *ip, int prefix,
     }
     ConvertInterfaceLuidToIndex(&luid, &ifindex);
 
+    /* Идемпотентность: сначала снимаем все прежние IPv4-адреса и маршруты по
+     * умолчанию с этого интерфейса, иначе при смене номера на адаптере
+     * накапливаются старый и новый адрес — и правки «не применяются». */
+    {
+        MIB_UNICASTIPADDRESS_TABLE *at = NULL;
+        MIB_IPFORWARD_TABLE2 *rt = NULL;
+        ULONG k;
+        if (GetUnicastIpAddressTable(AF_INET, &at) == NO_ERROR && at) {
+            for (k = 0; k < at->NumEntries; k++)
+                if (at->Table[k].InterfaceLuid.Value == luid.Value)
+                    DeleteUnicastIpAddressEntry(&at->Table[k]);
+            FreeMibTable(at);
+        }
+        if (GetIpForwardTable2(AF_INET, &rt) == NO_ERROR && rt) {
+            for (k = 0; k < rt->NumEntries; k++)
+                if (rt->Table[k].InterfaceLuid.Value == luid.Value &&
+                    rt->Table[k].DestinationPrefix.PrefixLength == 0)
+                    DeleteIpForwardEntry2(&rt->Table[k]);
+            FreeMibTable(rt);
+        }
+    }
+
     /* адрес */
     InitializeUnicastIpAddressEntry(&addr);
     addr.InterfaceLuid = luid;
@@ -418,6 +440,52 @@ BOOL winnet_configure(const char *guid, const char *ip, int prefix,
 }
 
 /* ------------------------------------------------------------- имя */
+void winnet_suppress_network_popup(void)
+{
+    /* Само присутствие этого ключа отключает мастер «Расположение в сети»,
+     * который выскакивает при появлении нового адаптера. */
+    HKEY k;
+    if (RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+            "SYSTEM\\CurrentControlSet\\Control\\Network\\NewNetworkWindowOff",
+            0, NULL, 0, KEY_WRITE, NULL, &k, NULL) == ERROR_SUCCESS)
+        RegCloseKey(k);
+}
+
+void winnet_suggest_name(char *out, size_t cap)
+{
+    ULONG size = 16 * 1024;
+    IP_ADAPTER_ADDRESSES *buf = NULL, *a;
+    int maxn = 0;
+    DWORD r;
+
+    ml_strlcpy(out, "Ethernet", cap);
+    for (;;) {
+        buf = (IP_ADAPTER_ADDRESSES *)malloc(size);
+        if (!buf) return;
+        r = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_UNICAST |
+                GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                GAA_FLAG_SKIP_DNS_SERVER, NULL, buf, &size);
+        if (r == ERROR_BUFFER_OVERFLOW) { free(buf); continue; }
+        if (r != NO_ERROR) { free(buf); return; }
+        break;
+    }
+    for (a = buf; a; a = a->Next) {
+        char *nm = a->FriendlyName ? ml_w_to_utf8(a->FriendlyName) : NULL;
+        if (nm) {
+            if (!_stricmp(nm, "Ethernet")) { if (maxn < 1) maxn = 1; }
+            else if (!_strnicmp(nm, "Ethernet ", 9)) {
+                int v = atoi(nm + 9);
+                if (v > maxn) maxn = v;
+            }
+            free(nm);
+        }
+    }
+    free(buf);
+    if (maxn == 0) ml_strlcpy(out, "Ethernet", cap);
+    else snprintf(out, cap, "Ethernet %d", maxn + 1);
+}
+
+
 /* Имя подключения (NetConnectionID) в «Сетевых подключениях». Пишем широкой
  * строкой — это и был фикс «хрени»: раньше UTF-8 байты читались как ANSI.
  * Живое применение имени Windows делает лениво (перечисление/перезагрузка);
@@ -425,13 +493,30 @@ BOOL winnet_configure(const char *guid, const char *ip, int prefix,
  * применяется сразу при cycle. */
 BOOL winnet_rename(const char *guid, const char *new_name, char *err, size_t errcap)
 {
-    char path[400];
+    char path[400], cmd[600];
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
     if (err && errcap) err[0] = 0;
+
+    /* 1. реестр — на будущее и как запас (переживёт перезагрузку) */
     snprintf(path, sizeof(path),
         "SYSTEM\\CurrentControlSet\\Control\\Network\\" NET_CLASS_GUID "\\%s\\Connection", guid);
-    if (!reg_set_wsz(HKEY_LOCAL_MACHINE, path, "Name", new_name)) {
-        if (err) snprintf(err, errcap, "не удалось переименовать %s", guid);
-        return FALSE;
+    reg_set_wsz(HKEY_LOCAL_MACHINE, path, "Name", new_name);
+
+    /* 2. живое применение через Rename-NetAdapter. Прямая запись в реестр имя
+     * подключения живьём не меняет (Windows кэширует), а этот путь — тот же,
+     * что использует система, и применяется сразу. Требует прав администратора,
+     * которые у режима агента и так есть. */
+    snprintf(cmd, sizeof(cmd),
+        "powershell -NoProfile -NonInteractive -Command "
+        "\"$a=Get-NetAdapter -EA 0 | Where-Object InterfaceGuid -eq '%s'; "
+        "if($a){Rename-NetAdapter -InputObject $a -NewName '%s' -Confirm:$false -EA 0}\"",
+        guid, new_name);
+    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                       NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 15000);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     }
     return TRUE;
 }

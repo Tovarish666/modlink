@@ -36,4 +36,11 @@ BOOL winnet_rename(const char *guid, const char *new_name, char *err, size_t err
 /* Передёрнуть адаптер (disable/enable), чтобы драйвер перечитал реестр. */
 BOOL winnet_cycle(const char *guid, char *err, size_t errcap);
 
+/* Следующее свободное имя вида «Ethernet N» — как штатные адаптеры Windows. */
+void winnet_suggest_name(char *out, size_t cap);
+
+/* Подавить всплывающее окно «Расположение в сети» для новых адаптеров —
+ * оно крадёт фокус и мигает поверх панели при каждом создании. */
+void winnet_suppress_network_popup(void);
+
 #endif

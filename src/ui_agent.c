@@ -308,6 +308,7 @@ static DWORD WINAPI apply_thread(LPVOID arg)
     char err[512];
     (void)arg;
 
+    winnet_suppress_network_popup();   /* без всплывающего окна «новая сеть» */
     tunnel_stop();
 
     for (i = 0; i < g_narows; i++) {
@@ -328,7 +329,7 @@ static DWORD WINAPI apply_thread(LPVOID arg)
         }
 
         if (!d->guid[0]) {
-            char inf[ML_PATH_LEN], mac[16];
+            char inf[ML_PATH_LEN], mac[16], name[64];
             snprintf(inf, sizeof(inf), "%s\\OemVista.inf", ml_dir_data());
             if (!winnet_create_adapter(inf, d->guid, sizeof(d->guid), err, sizeof(err))) {
                 char m[600];
@@ -342,9 +343,11 @@ static DWORD WINAPI apply_thread(LPVOID arg)
                      (n >> 4) & 0xFF, n & 0xFF, (n * 7) & 0xFF);
             winnet_disguise(d->guid, "Remote NDIS based Internet Sharing Device",
                             mac, "Huawei Technologies Co., Ltd.", err, sizeof(err));
-            /* Имя подключения не трогаем — Windows назовёт по-своему (Ethernet N),
-             * как обычные адаптеры. Состояние станет «Сеть N» само, когда через
-             * интерфейс пойдёт трафик. */
+            /* Имя как у штатных адаптеров: Ethernet, Ethernet 2, … По умолчанию
+             * Windows дал бы «Подключение по локальной сети N», что не сливается
+             * с остальными. Применяется после cycle. */
+            winnet_suggest_name(name, sizeof(name));
+            winnet_rename(d->guid, name, err, sizeof(err));
             winnet_cycle(d->guid, err, sizeof(err));
             made++;
         }
