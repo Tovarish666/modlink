@@ -87,7 +87,7 @@ input::placeholder{color:var(--tx3)}
 .sechead .count{font-family:var(--mono);font-size:11px;color:var(--tx3)}
 .sechead .sp{flex:1}
 .tablewrap{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:5px;overflow:hidden}
-.thead,.trow{display:grid;grid-template-columns:58px 128px 60px minmax(90px,1fr) minmax(90px,1fr) 118px 118px;
+.thead,.trow{display:grid;grid-template-columns:66px 140px 60px minmax(88px,1fr) minmax(88px,1fr) 112px 114px;
   align-items:center;gap:8px}
 .thead{padding:9px 10px;color:var(--tx3);font-size:10px;letter-spacing:.09em;text-transform:uppercase}
 .rowsbody{background:var(--inset);border-radius:8px;overflow:hidden}
@@ -209,7 +209,7 @@ input::placeholder{color:var(--tx3)}
 
       <div class="tablewrap">
         <div class="thead">
-          <span>№</span><span>Modem IP</span><span>Порт</span><span>Логин</span>
+          <span>№</span><span>IP</span><span>Порт</span><span>Логин</span>
           <span>Пароль</span><span>Внешний IP</span><span></span>
         </div>
         <div id="rows" class="rowsbody"></div>
@@ -296,7 +296,7 @@ function rowHTML(m){
   return `<div class="trow${dis}" data-row="${m.id}">
     <span class="cell-n"><span class="sdot" data-sdot="${m.id}"></span>
       <input data-id="${m.id}" data-field="n" value="${m.n}" inputmode="numeric"></span>
-    <input data-id="${m.id}" data-field="modem_ip" placeholder="192.168.${m.n}.1" inputmode="decimal">
+    <input data-id="${m.id}" data-field="lan_ip" placeholder="192.168.${m.n}.100" inputmode="decimal" title="интерфейс модема на этом ПК (3proxy -e)">
     <input data-id="${m.id}" data-field="proxy_port" value="${m.proxy_port}" inputmode="numeric">
     <input data-id="${m.id}" data-field="login" spellcheck="false">
     <input data-id="${m.id}" data-field="pass" spellcheck="false">
@@ -310,8 +310,6 @@ function rowHTML(m){
     </span>
     <div class="adv" data-adv="${m.id}">
       <div class="grid4">
-        <div><label>LAN IP (bind модема, -e)</label>
-          <input data-id="${m.id}" data-field="lan_ip" placeholder="192.168.${m.n}.100" inputmode="decimal"></div>
         <div><label>Порт реконнекта</label>
           <input data-id="${m.id}" data-field="reconn_port" value="${m.reconn_port}" inputmode="numeric"></div>
         <div><label>Авто-реконнект, мин (0 — выкл)</label>
@@ -319,6 +317,7 @@ function rowHTML(m){
         <div style="display:flex;align-items:flex-end">
           <label class="switch"><input type="checkbox" data-id="${m.id}" data-field="enabled" ${m.enabled?"checked":""}>включён</label>
         </div>
+        <div></div>
       </div>
       <div class="row2">
         <button class="btn" data-act="reboot" data-id="${m.id}">${svg(IC.reboot)}Ребут модема</button>
@@ -337,7 +336,7 @@ function render(){
   $("#rows").innerHTML=ST.modems.map(rowHTML).join("");
   ST.modems.forEach(m=>{
     setVal(m.id,"login",m.login); setVal(m.id,"pass",m.pass);
-    setVal(m.id,"modem_ip",m.modem_ip); setVal(m.id,"lan_ip",m.lan_ip);
+    setVal(m.id,"lan_ip",m.lan_ip);
     if(m.exit_ip){ const c=$(`[data-test="${m.id}"]`); if(c){c.textContent=m.exit_ip;c.className="testcell ok";} }
   });
   runningUI(); summary();
@@ -350,7 +349,7 @@ function collect(id){
   const str=f=>{const e=g(f);return e?e.value.trim():"";};
   const chk=f=>{const e=g(f);return e?!!e.checked:true;};
   return {id, n:num("n",1), login:str("login"), pass:str("pass"),
-    lan_ip:str("lan_ip"), modem_ip:str("modem_ip"),
+    lan_ip:str("lan_ip"),
     proxy_port:num("proxy_port",0), reconn_port:num("reconn_port",0),
     interval_min:num("interval_min",0), enabled:chk("enabled")};
 }

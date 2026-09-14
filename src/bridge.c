@@ -17,6 +17,17 @@ static BOOL             g_ready = FALSE;
 static void lock(void)   { if (g_ready) EnterCriticalSection(&g_lock); }
 static void unlock(void) { if (g_ready) LeaveCriticalSection(&g_lock); }
 
+/* The modem's HiLink web UI is always .1 in the interface's /24 (192.168.X.100
+ * -> 192.168.X.1). It is derived from the one IP field, never entered — a
+ * different value could only ever fail, so there is nothing to ask. */
+static void derive_gateway(const char *iface_ip, char *out, size_t cap)
+{
+    int a, b, c, d;
+    if (iface_ip && sscanf(iface_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4)
+        snprintf(out, cap, "%d.%d.%d.1", a, b, c);
+    else if (cap) out[0] = 0;
+}
+
 /* ------------------------------------------------------------- emitting */
 static char *jret(JBuf *b) { return b->buf ? b->buf : NULL; }
 
@@ -147,7 +158,8 @@ char *pv_update_modem(const char *req)
             ml_strlcpy(m->login,    json_str(o, "login",    m->login),    sizeof(m->login));
             ml_strlcpy(m->pass,     json_str(o, "pass",     m->pass),     sizeof(m->pass));
             ml_strlcpy(m->lan_ip,   json_str(o, "lan_ip",   m->lan_ip),   sizeof(m->lan_ip));
-            ml_strlcpy(m->modem_ip, json_str(o, "modem_ip", m->modem_ip), sizeof(m->modem_ip));
+            /* web UI address is derived from the interface, not entered */
+            derive_gateway(m->lan_ip, m->modem_ip, sizeof(m->modem_ip));
             m->proxy_port   = (int)json_num(o, "proxy_port",   m->proxy_port);
             m->reconn_port  = (int)json_num(o, "reconn_port",  m->reconn_port);
             m->interval_min = (int)json_num(o, "interval_min", m->interval_min);
