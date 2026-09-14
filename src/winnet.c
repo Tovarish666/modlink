@@ -269,6 +269,43 @@ BOOL winnet_disguise(const char *guid, const char *desc, const char *mac_hex,
     return TRUE;
 }
 
+/* Дождаться, пока адаптер реально поднимется (OperStatus=Up). Значения из
+ * реестра — описание, MAC — драйвер применяет при инициализации, а она
+ * завершается именно к этому моменту. Фиксированная пауза вместо ожидания и
+ * давала «то применилось, то нет». */
+static BOOL wait_oper_up(const char *guid, int timeout_ms)
+{
+    int waited = 0;
+    while (waited < timeout_ms) {
+        ULONG size = 16 * 1024;
+        IP_ADAPTER_ADDRESSES *buf = (IP_ADAPTER_ADDRESSES *)malloc(size), *a;
+        DWORD r;
+        BOOL up = FALSE;
+        if (!buf) return FALSE;
+        r = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_UNICAST |
+                GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                GAA_FLAG_SKIP_DNS_SERVER, NULL, buf, &size);
+        if (r == ERROR_BUFFER_OVERFLOW) {
+            free(buf); buf = (IP_ADAPTER_ADDRESSES *)malloc(size);
+            if (!buf) return FALSE;
+            r = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_UNICAST |
+                    GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                    GAA_FLAG_SKIP_DNS_SERVER, NULL, buf, &size);
+        }
+        if (r == NO_ERROR)
+            for (a = buf; a; a = a->Next)
+                if (a->AdapterName && !_stricmp(a->AdapterName, guid)) {
+                    up = (a->OperStatus == IfOperStatusUp);
+                    break;
+                }
+        free(buf);
+        if (up) return TRUE;
+        Sleep(250);
+        waited += 250;
+    }
+    return FALSE;
+}
+
 /* ------------------------------------------------------------- цикл питания */
 BOOL winnet_cycle(const char *guid, char *err, size_t errcap)
 {
@@ -298,7 +335,9 @@ BOOL winnet_cycle(const char *guid, char *err, size_t errcap)
     ok = SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, di, &data);
 
     SetupDiDestroyDeviceInfoList(di);
-    Sleep(2000);
+    /* Ждём реального Up, а не гадаем паузой — тогда маскировка применена точно. */
+    if (ok && !wait_oper_up(guid, 12000))
+        ml_log("winnet: адаптер %s не поднялся за 12с после enable", guid);
     if (!ok && err) snprintf(err, errcap, "DIF_PROPERTYCHANGE (ошибка %lu)", GetLastError());
     return ok;
 }

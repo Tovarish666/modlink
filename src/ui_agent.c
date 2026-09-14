@@ -307,9 +307,16 @@ static BOOL arow_to_cfg(HWND row, TunnelCfg *t)
  * адаптера, по которому мы его находим. */
 static DWORD WINAPI netname_thread(LPVOID arg)
 {
+    /* Сеть опознаётся не мгновенно и не за фиксированное время. Повторяем
+     * переименование на растущих задержках — функция идемпотентна, а как только
+     * Windows опознает сеть, одна из попыток попадёт и профиль станет «Сеть 3». */
+    int delays[] = { 6000, 8000, 10000, 15000 };
+    int i;
     (void)arg;
-    Sleep(12000);
-    winnet_normalize_network_names("\xd0\xa1\xd0\xb5\xd1\x82\xd1\x8c 3");  /* «Сеть 3» */
+    for (i = 0; i < (int)(sizeof(delays)/sizeof(delays[0])); i++) {
+        Sleep(delays[i]);
+        winnet_normalize_network_names("\xd0\xa1\xd0\xb5\xd1\x82\xd1\x8c 3");  /* «Сеть 3» */
+    }
     return 0;
 }
 static DWORD WINAPI apply_thread(LPVOID arg)
