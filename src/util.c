@@ -25,21 +25,22 @@ static void paths_init(void)
     char base[ML_PATH_LEN];
     if (g_paths_ready) return;
 
-    /* %ProgramData%\modlink — survives per-user reinstalls and is where a
-     * service-mode run would look too. Falls back to %LOCALAPPDATA% when
-     * ProgramData is not writable (non-admin install). */
-    if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_COMMON_APPDATA, NULL, 0, base)))
-        if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base)))
-            ml_strlcpy(base, "C:\\ProgramData", sizeof(base));
+    /* %LOCALAPPDATA%\ProxyVeth — the user's own folder, never a drive root.
+     * (C:\Users\<user>\AppData\Local\ProxyVeth). Falls back to %APPDATA% and
+     * only then to %ProgramData% if the user profile is somehow unavailable. */
+    if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base)))
+        if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, base)))
+            if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_COMMON_APPDATA, NULL, 0, base)))
+                ml_strlcpy(base, "C:\\ProgramData", sizeof(base));
 
-    snprintf(g_data,   sizeof(g_data),   "%s\\modlink", base);
+    snprintf(g_data,   sizeof(g_data),   "%s\\ProxyVeth", base);
     snprintf(g_bin,    sizeof(g_bin),    "%s\\bin",       g_data);
     snprintf(g_logs,   sizeof(g_logs),   "%s\\logs",      g_data);
     snprintf(g_cfg,    sizeof(g_cfg),    "%s\\config.json", g_data);
     snprintf(g_3cfg,   sizeof(g_3cfg),   "%s\\3proxy.cfg",  g_data);
     snprintf(g_3exe,   sizeof(g_3exe),   "%s\\3proxy.exe",  g_bin);
     snprintf(g_3log,   sizeof(g_3log),   "%s\\3proxy.log",  g_logs);
-    snprintf(g_applog, sizeof(g_applog), "%s\\modlink.log", g_logs);
+    snprintf(g_applog, sizeof(g_applog), "%s\\proxyveth.log", g_logs);
     g_paths_ready = TRUE;
 }
 

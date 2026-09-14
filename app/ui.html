@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ProxyVeth</title>
+<style>
+:root{
+  --bg:#050505; --rail:#09090b; --content:#0b0b0d; --card:#121216; --inset:#0e0e12;
+  --line:rgba(255,255,255,.07); --line2:rgba(255,255,255,.11);
+  --tx:#f3f4f6; --tx2:#9a9aa2; --tx3:#62626a; --data:#d7d7dc;
+  --acc:#a78bfa; --acc-dim:#8b6ff5; --on:#1b1240; --ok:#5ee0a0; --warn:#f0a94a; --danger:#fb7185;
+  --mono:'SF Mono','JetBrains Mono','Cascadia Code',ui-monospace,Consolas,monospace;
+  --sans:'SF Pro Display','Segoe UI Variable Text','Segoe UI',system-ui,-apple-system,sans-serif;
+  --ease:cubic-bezier(.32,.72,0,1);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:13px;
+  display:flex;overflow:hidden;-webkit-user-select:none;user-select:none}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:6px;border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.18);background-clip:content-box}
+
+/* ---- rail ---- */
+.rail{width:170px;flex-shrink:0;background:var(--rail);border-right:1px solid var(--line);
+  display:flex;flex-direction:column;padding:14px 10px}
+.brand{display:flex;align-items:center;gap:9px;padding:4px 8px 16px}
+.brand .dot{width:9px;height:9px;border-radius:50%;background:var(--acc);box-shadow:0 0 0 3px rgba(167,139,250,.16)}
+.brand b{font-size:14px;font-weight:500;letter-spacing:-.01em}
+.nav{display:flex;align-items:center;gap:10px;padding:8px 9px;border-radius:8px;color:var(--tx2);
+  font-size:13px;cursor:pointer;margin-bottom:2px;transition:background .16s var(--ease),color .16s var(--ease)}
+.nav svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.6}
+.nav:hover{color:var(--tx);background:rgba(255,255,255,.04)}
+.nav.on{color:var(--tx);background:rgba(167,139,250,.14)}
+.rail .foot{margin-top:auto;padding:10px 9px 2px;border-top:1px solid var(--line);
+  font-family:var(--mono);font-size:11px;color:var(--tx3);line-height:1.7}
+.rail .foot .st{display:inline-flex;align-items:center;gap:6px;color:var(--tx2)}
+.rail .foot .st i{width:7px;height:7px;border-radius:50%;background:var(--tx3)}
+.rail .foot .st.up i{background:var(--ok)}
+
+/* ---- main ---- */
+.main{flex:1;min-width:0;display:flex;flex-direction:column;background:var(--content)}
+.topbar{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line)}
+.topbar h1{font-size:16px;font-weight:500;letter-spacing:-.01em}
+.topbar .sub{font-family:var(--mono);font-size:11px;color:var(--tx3)}
+.topbar .sp{flex:1}
+.scroll{flex:1;overflow-y:auto;padding:18px 20px 40px}
+
+/* ---- buttons ---- */
+.btn{font-family:inherit;font-size:12px;padding:7px 13px;border-radius:8px;cursor:pointer;
+  border:1px solid var(--line2);background:transparent;color:var(--tx);display:inline-flex;
+  align-items:center;gap:7px;transition:background .16s var(--ease),border-color .16s var(--ease),transform .1s var(--ease),filter .16s var(--ease)}
+.btn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7}
+.btn:hover{background:rgba(255,255,255,.05)}
+.btn:active{transform:scale(.98)}
+.btn.acc{background:var(--acc);border-color:transparent;color:var(--on);font-weight:500}
+.btn.acc:hover{filter:brightness(1.08);background:var(--acc)}
+.btn.ghost{border-color:transparent;color:var(--tx2);padding:6px 9px}
+.btn.ghost:hover{color:var(--tx);background:rgba(255,255,255,.05)}
+.btn:disabled{opacity:.5;cursor:default}
+
+/* ---- pills ---- */
+.pill{display:inline-flex;align-items:center;gap:7px;font-size:11.5px;padding:5px 10px;border-radius:8px;
+  border:1px solid var(--line2);color:var(--tx2)}
+.pill i{width:7px;height:7px;border-radius:50%;background:var(--tx3)}
+.pill.up{color:var(--ok);border-color:rgba(94,224,160,.28);background:rgba(94,224,160,.08)}
+.pill.up i{background:var(--ok);box-shadow:0 0 0 3px rgba(94,224,160,.16)}
+
+/* ---- network card ---- */
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:6px}
+.card .inner{background:transparent;padding:14px 15px}
+.eyebrow{font-size:10px;font-weight:500;letter-spacing:.16em;text-transform:uppercase;color:var(--tx3);margin-bottom:12px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.field label{display:block;font-size:12px;color:var(--tx2);margin-bottom:5px}
+.field .hint{font-size:11px;color:var(--tx3);margin-top:5px;line-height:1.4}
+input,select{font-family:var(--mono);font-size:13px;color:var(--data);background:var(--inset);
+  border:1px solid var(--line2);border-radius:8px;padding:8px 10px;width:100%;outline:none;
+  transition:border-color .16s var(--ease),box-shadow .16s var(--ease);-webkit-user-select:text;user-select:text}
+input:hover{border-color:rgba(255,255,255,.18)}
+input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(167,139,250,.14)}
+input::placeholder{color:var(--tx3)}
+
+/* ---- modems ---- */
+.sechead{display:flex;align-items:center;gap:10px;margin:22px 2px 10px}
+.sechead h2{font-size:13px;font-weight:500;color:var(--tx)}
+.sechead .count{font-family:var(--mono);font-size:11px;color:var(--tx3)}
+.sechead .sp{flex:1}
+.tablewrap{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:5px;overflow:hidden}
+.thead,.trow{display:grid;grid-template-columns:58px 128px 60px minmax(90px,1fr) minmax(90px,1fr) 118px 118px;
+  align-items:center;gap:8px}
+.thead{padding:9px 10px;color:var(--tx3);font-size:10px;letter-spacing:.09em;text-transform:uppercase}
+.rowsbody{background:var(--inset);border-radius:8px;overflow:hidden}
+.trow{padding:7px 10px;border-top:1px solid var(--line)}
+.rowsbody .trow:first-child{border-top:none}
+.trow.dis{opacity:.45}
+.cell-n{display:flex;align-items:center;gap:8px}
+.cell-n .sdot{width:6px;height:6px;border-radius:50%;background:var(--tx3);flex-shrink:0}
+.cell-n .sdot.up{background:var(--ok)}
+.cell-n .sdot.warn{background:var(--warn)}
+.trow input{background:transparent;border:1px solid transparent;border-radius:6px;padding:6px 7px}
+.trow input:hover{border-color:var(--line2);background:var(--inset)}
+.trow input:focus{border-color:var(--acc);background:var(--bg)}
+.cell-n input{width:34px;text-align:center;color:var(--acc);font-weight:500}
+.rowacts{display:flex;align-items:center;gap:2px;justify-content:flex-end}
+.iact{width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;border-radius:7px;
+  color:var(--tx3);cursor:pointer;transition:color .15s var(--ease),background .15s var(--ease)}
+.iact:hover{color:var(--tx);background:rgba(255,255,255,.06)}
+.iact.danger:hover{color:var(--danger);background:rgba(251,113,133,.1)}
+.iact svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7}
+.testcell{font-family:var(--mono);font-size:11px;color:var(--tx3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.testcell.ok{color:var(--ok)}
+.testcell.fail{color:var(--danger)}
+
+/* advanced expand */
+.adv{grid-column:1/-1;display:none;padding:10px 6px 6px;border-top:1px dashed var(--line)}
+.adv.open{display:block}
+.adv .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.adv label{font-size:11px;color:var(--tx3);margin-bottom:5px;display:block}
+.adv .row2{display:flex;gap:8px;margin-top:10px;align-items:center}
+.switch{display:inline-flex;align-items:center;gap:8px;font-size:12px;color:var(--tx2);cursor:pointer}
+.switch input{width:auto}
+
+/* empty / adapters */
+.empty{max-width:420px;margin:60px auto;text-align:center}
+.empty .ico{width:52px;height:52px;margin:0 auto 16px;border-radius:13px;background:rgba(255,255,255,.03);
+  border:1px solid var(--line);display:flex;align-items:center;justify-content:center;color:var(--tx2)}
+.empty .ico svg{width:24px;height:24px;stroke:currentColor;fill:none;stroke-width:1.5}
+.empty h3{font-size:15px;font-weight:500;margin-bottom:7px}
+.empty p{font-size:12.5px;color:var(--tx2);line-height:1.65}
+
+/* toast */
+.toasts{position:fixed;right:18px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50}
+.toast{background:#17171c;border:1px solid var(--line2);border-radius:10px;padding:10px 13px;font-size:12.5px;
+  color:var(--tx);max-width:340px;box-shadow:0 12px 30px -12px rgba(0,0,0,.7);
+  display:flex;gap:9px;align-items:flex-start;animation:tin .22s var(--ease)}
+.toast .bar{width:3px;align-self:stretch;border-radius:3px;background:var(--acc);flex-shrink:0}
+.toast.ok .bar{background:var(--ok)} .toast.err .bar{background:var(--danger)}
+@keyframes tin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.view{display:none} .view.on{display:block}
+.spin{animation:sp 1s linear infinite} @keyframes sp{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+
+<nav class="rail">
+  <div class="brand"><span class="dot"></span><b>ProxyVeth</b></div>
+  <div class="nav on" data-view="server">
+    <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><circle cx="7" cy="7.5" r=".6"/><circle cx="7" cy="16.5" r=".6"/></svg>
+    Сервер
+  </div>
+  <div class="nav" data-view="adapters">
+    <svg viewBox="0 0 24 24"><path d="M9 7V3M15 7V3M8 7h8v4a4 4 0 0 1-8 0zM12 15v6"/></svg>
+    Адаптеры
+  </div>
+  <div class="foot">
+    <span id="railStatus" class="st"><i></i><span id="railStatusText">остановлен</span></span><br>
+    <span id="railMeta">модемов 0</span><br>
+    <span style="color:var(--tx3)">ProxyVeth 2.0</span>
+  </div>
+</nav>
+
+<main class="main">
+
+  <!-- SERVER -->
+  <section class="view on" data-view="server">
+    <div class="topbar">
+      <h1>Сервер</h1>
+      <span id="topSub" class="sub"></span>
+      <span class="sp"></span>
+      <span id="runPill" class="pill"><i></i><span id="runPillText">остановлен</span></span>
+      <button id="btnStop" class="btn">
+        <svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>Стоп</button>
+      <button id="btnApply" class="btn acc">
+        <svg viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></svg>Применить</button>
+    </div>
+
+    <div class="scroll">
+      <div class="card">
+        <div class="inner">
+          <div class="eyebrow">Основная сеть</div>
+          <div class="grid3">
+            <div class="field">
+              <label>IP этого хоста</label>
+              <input id="netLan" data-net="lan_ip" placeholder="192.168.1.10" inputmode="decimal">
+              <div class="hint">адрес ПК в основной сети — на нём слушают прокси (3proxy -i)</div>
+            </div>
+            <div class="field">
+              <label>Внешний IP</label>
+              <input id="netWan" data-net="wan_ip" placeholder="95.165.83.236" inputmode="decimal">
+              <div class="hint">адрес для строк прокси, что раздаёшь клиентам</div>
+            </div>
+            <div class="field">
+              <label>Базовый порт</label>
+              <input id="netBase" data-net="base_port" placeholder="15000" inputmode="numeric">
+              <div class="hint">с него предлагаются порты новым модемам</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sechead">
+        <h2>Модемы</h2><span id="modCount" class="count">0</span>
+        <span class="sp"></span>
+        <button id="btnAdd" class="btn acc">
+          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Модем</button>
+      </div>
+
+      <div class="tablewrap">
+        <div class="thead">
+          <span>№</span><span>Modem IP</span><span>Порт</span><span>Логин</span>
+          <span>Пароль</span><span>Внешний IP</span><span></span>
+        </div>
+        <div id="rows" class="rowsbody"></div>
+      </div>
+      <div id="emptyModems" class="empty" style="display:none">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M4 7h16v10H4zM4 11h16M8 15h3"/></svg></div>
+        <h3>Пока нет модемов</h3>
+        <p>Нажми «Модем», чтобы добавить первую строку. Порт, логин, пароль и адреса
+        вида 192.168.N.x подставятся автоматически — потом правь под свои.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ADAPTERS -->
+  <section class="view" data-view="adapters">
+    <div class="topbar"><h1>Адаптеры</h1><span class="sub">виртуальные интерфейсы</span></div>
+    <div class="scroll">
+      <div class="empty">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M9 7V3M15 7V3M8 7h8v4a4 4 0 0 1-8 0zM12 15v6"/></svg></div>
+        <h3>Раздел в работе</h3>
+        <p>Здесь появятся виртуальные адаптеры — Ethernet N, состояние «Сеть N»,
+        маскировка под Remote NDIS. Создание, редактирование и удаление прямо из панели.</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+"use strict";
+const $=(s,r=document)=>r.querySelector(s);
+const $$=(s,r=document)=>[...r.querySelectorAll(s)];
+let ST={running:false,network:{lan_ip:"",wan_ip:"",base_port:15000},modems:[]};
+
+/* ---- bridge helpers (webview injects pv_* as globals returning promises) ---- */
+async function api(name,...args){
+  if(typeof window[name]!=="function"){ throw new Error("bridge "+name+" недоступен"); }
+  return await window[name](...args);
+}
+
+/* ---- toast ---- */
+function toast(msg,type){
+  const t=document.createElement("div");
+  t.className="toast"+(type?" "+type:"");
+  t.innerHTML='<span class="bar"></span><span></span>';
+  t.lastChild.textContent=msg;
+  $("#toasts").appendChild(t);
+  setTimeout(()=>{t.style.transition="opacity .3s";t.style.opacity="0";setTimeout(()=>t.remove(),320);},3600);
+}
+
+/* ---- svg icons ---- */
+const IC={
+  test:'<path d="M13 3L4 14h6l-1 7 9-11h-6z"/>',
+  reconn:'<path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/>',
+  chev:'<path d="M6 9l6 6 6-6"/>',
+  copy:'<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+  trash:'<path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M7 7l1 13h8l1-13"/>',
+  reboot:'<path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/>'
+};
+const svg=p=>'<svg viewBox="0 0 24 24">'+p+'</svg>';
+
+/* ---- render ---- */
+function esc(s){return String(s==null?"":s)}
+function runningUI(){
+  const up=ST.running;
+  $("#runPill").className="pill"+(up?" up":"");
+  $("#runPillText").textContent=up?"работает":"остановлен";
+  $("#btnStop").disabled=!up;
+  const rs=$("#railStatus"); rs.className="st"+(up?" up":"");
+  $("#railStatusText").textContent=up?"3proxy работает":"остановлен";
+}
+function summary(){
+  const n=ST.modems.length;
+  $("#modCount").textContent=n;
+  $("#railMeta").textContent="модемов "+n;
+  const host=ST.network.lan_ip||"0.0.0.0";
+  $("#topSub").textContent=host+" · базовый :"+(ST.network.base_port||15000);
+  $("#emptyModems").style.display=n?"none":"block";
+  $(".tablewrap").style.display=n?"block":"none";
+}
+function rowHTML(m){
+  const dis=m.enabled?"":" dis";
+  return `<div class="trow${dis}" data-row="${m.id}">
+    <span class="cell-n"><span class="sdot" data-sdot="${m.id}"></span>
+      <input data-id="${m.id}" data-field="n" value="${m.n}" inputmode="numeric"></span>
+    <input data-id="${m.id}" data-field="modem_ip" placeholder="192.168.${m.n}.1" inputmode="decimal">
+    <input data-id="${m.id}" data-field="proxy_port" value="${m.proxy_port}" inputmode="numeric">
+    <input data-id="${m.id}" data-field="login" spellcheck="false">
+    <input data-id="${m.id}" data-field="pass" spellcheck="false">
+    <span class="testcell" data-test="${m.id}">—</span>
+    <span class="rowacts">
+      <span class="iact" data-act="test" data-id="${m.id}" title="Test">${svg(IC.test)}</span>
+      <span class="iact" data-act="reconn" data-id="${m.id}" title="Реконнект">${svg(IC.reconn)}</span>
+      <span class="iact" data-act="copy" data-id="${m.id}" title="Копировать строку">${svg(IC.copy)}</span>
+      <span class="iact" data-act="adv" data-id="${m.id}" title="Ещё">${svg(IC.chev)}</span>
+      <span class="iact danger" data-act="del" data-id="${m.id}" title="Удалить">${svg(IC.trash)}</span>
+    </span>
+    <div class="adv" data-adv="${m.id}">
+      <div class="grid4">
+        <div><label>LAN IP (bind модема, -e)</label>
+          <input data-id="${m.id}" data-field="lan_ip" placeholder="192.168.${m.n}.100" inputmode="decimal"></div>
+        <div><label>Порт реконнекта</label>
+          <input data-id="${m.id}" data-field="reconn_port" value="${m.reconn_port}" inputmode="numeric"></div>
+        <div><label>Авто-реконнект, мин (0 — выкл)</label>
+          <input data-id="${m.id}" data-field="interval_min" value="${m.interval_min}" inputmode="numeric"></div>
+        <div style="display:flex;align-items:flex-end">
+          <label class="switch"><input type="checkbox" data-id="${m.id}" data-field="enabled" ${m.enabled?"checked":""}>включён</label>
+        </div>
+      </div>
+      <div class="row2">
+        <button class="btn" data-act="reboot" data-id="${m.id}">${svg(IC.reboot)}Ребут модема</button>
+      </div>
+    </div>
+  </span></div>`;
+}
+function setVal(id,field,val){
+  const el=$(`#rows input[data-id="${id}"][data-field="${field}"]`);
+  if(el) el.value=(val==null?"":val);
+}
+function render(){
+  $("#netLan").value=ST.network.lan_ip||"";
+  $("#netWan").value=ST.network.wan_ip||"";
+  $("#netBase").value=ST.network.base_port||15000;
+  $("#rows").innerHTML=ST.modems.map(rowHTML).join("");
+  ST.modems.forEach(m=>{
+    setVal(m.id,"login",m.login); setVal(m.id,"pass",m.pass);
+    setVal(m.id,"modem_ip",m.modem_ip); setVal(m.id,"lan_ip",m.lan_ip);
+    if(m.exit_ip){ const c=$(`[data-test="${m.id}"]`); if(c){c.textContent=m.exit_ip;c.className="testcell ok";} }
+  });
+  runningUI(); summary();
+}
+
+/* ---- collect one modem row into an object ---- */
+function collect(id){
+  const g=f=>$(`#rows [data-id="${id}"][data-field="${f}"]`);
+  const num=(f,d)=>{const e=g(f);const v=parseInt(e&&e.value,10);return isNaN(v)?d:v;};
+  const str=f=>{const e=g(f);return e?e.value.trim():"";};
+  const chk=f=>{const e=g(f);return e?!!e.checked:true;};
+  return {id, n:num("n",1), login:str("login"), pass:str("pass"),
+    lan_ip:str("lan_ip"), modem_ip:str("modem_ip"),
+    proxy_port:num("proxy_port",0), reconn_port:num("reconn_port",0),
+    interval_min:num("interval_min",0), enabled:chk("enabled")};
+}
+async function saveModem(id){ ST=await api("pv_update_modem",collect(id)); /* no re-render: DOM already current */ }
+
+/* ---- events ---- */
+function bindEvents(){
+  // nav
+  $$(".rail .nav").forEach(n=>n.onclick=()=>{
+    const v=n.dataset.view;
+    $$(".rail .nav").forEach(x=>x.classList.toggle("on",x===n));
+    $$(".view").forEach(s=>s.classList.toggle("on",s.dataset.view===v));
+  });
+  // network fields
+  $$("[data-net]").forEach(inp=>inp.addEventListener("change",async()=>{
+    ST=await api("pv_save_network",{lan_ip:$("#netLan").value.trim(),
+      wan_ip:$("#netWan").value.trim(), base_port:parseInt($("#netBase").value,10)||15000});
+    summary();
+  }));
+  // delegated modem row edits
+  $("#rows").addEventListener("change",e=>{
+    const el=e.target.closest("[data-id][data-field]");
+    if(el) saveModem(parseInt(el.dataset.id,10));
+    if(el&&el.dataset.field==="enabled"){
+      const row=el.closest(".trow"); if(row) row.classList.toggle("dis",!el.checked);
+    }
+  });
+  // delegated actions
+  $("#rows").addEventListener("click",e=>{
+    const a=e.target.closest("[data-act]"); if(!a) return;
+    const id=parseInt(a.dataset.id,10);
+    const act=a.dataset.act;
+    if(act==="adv"){ const p=$(`[data-adv="${id}"]`); if(p){p.classList.toggle("open");
+      a.style.transform=p.classList.contains("open")?"rotate(180deg)":"";} }
+    else if(act==="del") delModem(id);
+    else if(act==="test") doTest(id,a);
+    else if(act==="reconn") doReconn(id,a);
+    else if(act==="reboot") doReboot(id);
+    else if(act==="copy") doCopy(id);
+  });
+  $("#btnAdd").onclick=addModem;
+  $("#btnApply").onclick=apply;
+  $("#btnStop").onclick=stop;
+}
+
+async function addModem(){ ST=await api("pv_add_modem"); render();
+  const rows=$("#rows"); rows.scrollTop=rows.scrollHeight; }
+async function delModem(id){
+  const m=ST.modems.find(x=>x.id===id);
+  if(!confirm("Удалить модем №"+(m?m.n:id)+"?")) return;
+  ST=await api("pv_delete_modem",id); render();
+}
+async function apply(){
+  const b=$("#btnApply"); b.disabled=true; b.querySelector("svg").classList.add("spin");
+  try{
+    const r=await api("pv_apply");
+    ST.running=!!r.running; runningUI();
+    if(r.ok) toast("Применено — 3proxy запущен","ok");
+    else toast(r.err||"Ошибка применения","err");
+  }catch(e){ toast(String(e.message||e),"err"); }
+  b.disabled=false; b.querySelector("svg").classList.remove("spin");
+}
+async function stop(){
+  const r=await api("pv_stop"); ST.running=!!r.running; runningUI();
+  toast("3proxy остановлен");
+}
+async function doTest(id,a){
+  const cell=$(`[data-test="${id}"]`); const dot=$(`[data-sdot="${id}"]`);
+  cell.textContent="…"; cell.className="testcell"; a.querySelector("svg").classList.add("spin");
+  try{
+    const r=await api("pv_test",id);
+    if(r.ok){ cell.textContent=r.exit_ip+(r.huawei?"  ·H":""); cell.className="testcell ok";
+      if(dot) dot.className="sdot up"; }
+    else { cell.textContent=r.err||"нет ответа"; cell.className="testcell fail";
+      if(dot) dot.className="sdot warn"; }
+  }catch(e){ cell.textContent="ошибка"; cell.className="testcell fail"; }
+  a.querySelector("svg").classList.remove("spin");
+}
+async function doReconn(id,a){
+  a.querySelector("svg").classList.add("spin");
+  try{ const r=await api("pv_reconnect",id);
+    toast((r.ok?"Реконнект: ":"Реконнект не удался: ")+(r.msg||""),r.ok?"ok":"err");
+  }catch(e){ toast(String(e.message||e),"err"); }
+  a.querySelector("svg").classList.remove("spin");
+}
+async function doReboot(id){
+  const m=ST.modems.find(x=>x.id===id);
+  if(!confirm("Перезагрузить модем №"+(m?m.n:id)+"?")) return;
+  try{ const r=await api("pv_reboot",id); toast((r.ok?"Ребут отправлен: ":"Ошибка: ")+(r.msg||""),r.ok?"ok":"err"); }
+  catch(e){ toast(String(e.message||e),"err"); }
+}
+async function doCopy(id){
+  const m=ST.modems.find(x=>x.id===id); if(!m) return;
+  const ip=ST.network.wan_ip||ST.network.lan_ip||"IP";
+  const line=`${ip}:${m.proxy_port}:${m.login}:${m.pass}`;
+  try{ await navigator.clipboard.writeText(line); toast("Скопировано: "+line,"ok"); }
+  catch(e){ toast(line); }
+}
+
+/* ---- boot (wait until bridge is injected) ---- */
+async function boot(tries){
+  if(typeof window.pv_get_state!=="function"){
+    if(tries>50){ document.body.innerHTML="<p style='padding:2rem;font:14px sans-serif'>Мост UI недоступен — запусти через ProxyVeth.exe</p>"; return; }
+    return setTimeout(()=>boot((tries||0)+1),60);
+  }
+  try{ ST=await api("pv_get_state"); }catch(e){ ST.modems=[]; }
+  bindEvents(); render();
+}
+document.addEventListener("DOMContentLoaded",()=>boot(0));
+</script>
+</body>
+</html>

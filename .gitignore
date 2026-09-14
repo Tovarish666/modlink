@@ -1,7 +1,9 @@
 build/
 dist/
+packages/
 res/3proxy.exe
 res/3proxy.version.txt
+res/ui.html
 *.obj
 *.res
 *.pdb

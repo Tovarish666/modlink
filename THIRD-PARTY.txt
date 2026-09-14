@@ -1,9 +1,9 @@
-modlink bundles the following third-party component.
+ProxyVeth bundles the following third-party components.
 
 ================================================================================
 3proxy — https://github.com/3proxy/3proxy
-Version 1.0.0, redistributed as an unmodified binary embedded in modlink.exe
-and extracted to %ProgramData%\modlink\bin\3proxy.exe at runtime.
+Version 1.0.0, redistributed as an unmodified binary embedded in proxyveth.exe
+and extracted to %LOCALAPPDATA%\ProxyVeth\bin\3proxy.exe at runtime.
 
 3proxy Public License Agreement
 
@@ -39,4 +39,27 @@ are met (BSD style license):
     this software without specific prior written permission.
 
 Full text: https://github.com/3proxy/3proxy/blob/master/copying
+================================================================================
+webview — https://github.com/webview/webview
+Version 0.10.0, vendored as source (third_party/webview/webview.h) and compiled
+into proxyveth.exe. Provides the WebView2 window host.
+
+MIT License
+(c) 2017 Serge Zaitsev
+(c) 2022 Steffen André Langnes
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the above copyright notice and this permission notice being included
+in all copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED
+"AS IS", WITHOUT WARRANTY OF ANY KIND.
+================================================================================
+Microsoft Edge WebView2 — the rendering runtime.
+Not redistributed: proxyveth.exe uses the WebView2 Runtime already present on
+Windows 10/11 (shipped with Microsoft Edge). Only the SDK header (WebView2.h) is
+used at build time, under the Microsoft Software License Terms for the
+Microsoft.Web.WebView2 package.
 ================================================================================

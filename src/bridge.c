@@ -1,0 +1,326 @@
+/* ProxyVeth — implementation of the UI<->backend bridge (see bridge.h).
+ *
+ * Holds the single in-memory Config, guarded by one lock. Fast mutations run
+ * on the UI thread; the host runs apply/test/reconnect/reboot on worker
+ * threads, so those snapshot what they need under the lock and release it
+ * before touching the network. */
+#include "common.h"
+#include "json.h"
+#include "bridge.h"
+#include <string.h>
+#include <stdlib.h>
+
+static Config           g_cfg;
+static CRITICAL_SECTION g_lock;
+static BOOL             g_ready = FALSE;
+
+static void lock(void)   { if (g_ready) EnterCriticalSection(&g_lock); }
+static void unlock(void) { if (g_ready) LeaveCriticalSection(&g_lock); }
+
+/* ------------------------------------------------------------- emitting */
+static char *jret(JBuf *b) { return b->buf ? b->buf : NULL; }
+
+static void emit_modem(JBuf *b, const Modem *m)
+{
+    jb_raw(b, "{");
+    jb_kv_int (b, "id",           m->id);           jb_raw(b, ",");
+    jb_kv_int (b, "n",            m->n);            jb_raw(b, ",");
+    jb_kv_str (b, "login",        m->login);        jb_raw(b, ",");
+    jb_kv_str (b, "pass",         m->pass);         jb_raw(b, ",");
+    jb_kv_str (b, "lan_ip",       m->lan_ip);       jb_raw(b, ",");
+    jb_kv_str (b, "modem_ip",     m->modem_ip);     jb_raw(b, ",");
+    jb_kv_int (b, "proxy_port",   m->proxy_port);   jb_raw(b, ",");
+    jb_kv_int (b, "reconn_port",  m->reconn_port);  jb_raw(b, ",");
+    jb_kv_int (b, "interval_min", m->interval_min); jb_raw(b, ",");
+    jb_kv_bool(b, "enabled",      m->enabled);      jb_raw(b, ",");
+    jb_kv_str (b, "exit_ip",      m->last_exit_ip);
+    jb_raw(b, "}");
+}
+
+/* Full state snapshot. Caller must already hold the lock. */
+static char *emit_state_locked(void)
+{
+    JBuf b; int i;
+    jb_init(&b);
+    jb_raw(&b, "{");
+    jb_kv_bool(&b, "running", p3_running()); jb_raw(&b, ",");
+    jb_raw(&b, "\"network\":{");
+    jb_kv_str(&b, "lan_ip",    g_cfg.lan_ip);  jb_raw(&b, ",");
+    jb_kv_str(&b, "wan_ip",    g_cfg.wan_ip);  jb_raw(&b, ",");
+    jb_kv_int(&b, "base_port", g_cfg.base_port);
+    jb_raw(&b, "},\"modems\":[");
+    for (i = 0; i < g_cfg.count; i++) {
+        if (i) jb_raw(&b, ",");
+        emit_modem(&b, &g_cfg.modems[i]);
+    }
+    jb_raw(&b, "]}");
+    return jret(&b);
+}
+
+/* ------------------------------------------------------------- req parsing */
+/* The webview RPC hands the callback a JSON array of the JS call's arguments.
+ * Our calls pass at most one argument, so element 0 is what we want. Returns
+ * the parsed root (caller frees with json_free) and *first = element 0. */
+static JVal *req_root(const char *req, const JVal **first)
+{
+    JVal *root = req ? json_parse(req) : NULL;
+    *first = (root && root->type == J_ARR) ? root->child : NULL;
+    return root;
+}
+
+/* ------------------------------------------------------------- lifecycle */
+void pv_init(void)
+{
+    if (!g_ready) { InitializeCriticalSection(&g_lock); g_ready = TRUE; }
+    ml_ensure_dirs();
+    p3_extract_binary();
+    lock();
+    if (!cfg_load(&g_cfg)) cfg_defaults(&g_cfg);
+    unlock();
+    ml_log("bridge init: %d modems", g_cfg.count);
+}
+
+void pv_shutdown(void)
+{
+    reconn_shutdown();
+    p3_stop();
+}
+
+/* ------------------------------------------------------------- read */
+char *pv_get_state(const char *req)
+{
+    char *s; (void)req;
+    lock(); s = emit_state_locked(); unlock();
+    return s;
+}
+
+char *pv_status(const char *req)
+{
+    JBuf b; (void)req;
+    jb_init(&b);
+    jb_raw(&b, "{");
+    jb_kv_bool(&b, "running", p3_running());
+    jb_raw(&b, "}");
+    return jret(&b);
+}
+
+/* ------------------------------------------------------------- mutate */
+char *pv_save_network(const char *req)
+{
+    const JVal *o; JVal *root = req_root(req, &o);
+    char *s;
+    lock();
+    if (o && o->type == J_OBJ) {
+        ml_strlcpy(g_cfg.lan_ip, json_str(o, "lan_ip", g_cfg.lan_ip), sizeof(g_cfg.lan_ip));
+        ml_strlcpy(g_cfg.wan_ip, json_str(o, "wan_ip", g_cfg.wan_ip), sizeof(g_cfg.wan_ip));
+        int bp = (int)json_num(o, "base_port", g_cfg.base_port);
+        if (ml_port_valid(bp)) g_cfg.base_port = bp;
+        cfg_save(&g_cfg);
+    }
+    s = emit_state_locked();
+    unlock();
+    json_free(root);
+    return s;
+}
+
+char *pv_add_modem(const char *req)
+{
+    char *s; (void)req;
+    lock();
+    cfg_add_modem(&g_cfg);
+    cfg_save(&g_cfg);
+    s = emit_state_locked();
+    unlock();
+    return s;
+}
+
+char *pv_update_modem(const char *req)
+{
+    const JVal *o; JVal *root = req_root(req, &o);
+    char *s;
+    lock();
+    if (o && o->type == J_OBJ) {
+        int id = (int)json_num(o, "id", 0);
+        Modem *m = cfg_find_by_id(&g_cfg, id);
+        if (m) {
+            m->n = (int)json_num(o, "n", m->n);
+            ml_strlcpy(m->login,    json_str(o, "login",    m->login),    sizeof(m->login));
+            ml_strlcpy(m->pass,     json_str(o, "pass",     m->pass),     sizeof(m->pass));
+            ml_strlcpy(m->lan_ip,   json_str(o, "lan_ip",   m->lan_ip),   sizeof(m->lan_ip));
+            ml_strlcpy(m->modem_ip, json_str(o, "modem_ip", m->modem_ip), sizeof(m->modem_ip));
+            m->proxy_port   = (int)json_num(o, "proxy_port",   m->proxy_port);
+            m->reconn_port  = (int)json_num(o, "reconn_port",  m->reconn_port);
+            m->interval_min = (int)json_num(o, "interval_min", m->interval_min);
+            m->enabled      =      json_bool(o, "enabled",     m->enabled);
+            cfg_save(&g_cfg);
+        }
+    }
+    s = emit_state_locked();
+    unlock();
+    json_free(root);
+    return s;
+}
+
+char *pv_delete_modem(const char *req)
+{
+    const JVal *o; JVal *root = req_root(req, &o);
+    char *s; int id, i;
+    lock();
+    id = (o && o->type == J_NUM) ? (int)o->num : 0;
+    for (i = 0; i < g_cfg.count; i++)
+        if (g_cfg.modems[i].id == id) { cfg_remove_modem(&g_cfg, i); cfg_save(&g_cfg); break; }
+    s = emit_state_locked();
+    unlock();
+    json_free(root);
+    return s;
+}
+
+char *pv_stop(const char *req)
+{
+    JBuf b; (void)req;
+    reconn_shutdown();
+    p3_stop();
+    jb_init(&b);
+    jb_raw(&b, "{"); jb_kv_bool(&b, "ok", 1); jb_raw(&b, ",");
+    jb_kv_bool(&b, "running", 0); jb_raw(&b, "}");
+    return jret(&b);
+}
+
+/* ------------------------------------------------------------- slow ops */
+char *pv_apply(const char *req)
+{
+    char err[ML_PATH_LEN] = {0};
+    JBuf b; BOOL ok; int bad; (void)req;
+
+    lock();
+    bad = cfg_validate(&g_cfg, err, sizeof(err));
+    if (bad != -1) { ok = FALSE; }
+    else {
+        ok = p3_apply(&g_cfg, err, sizeof(err));
+        if (ok) reconn_rebuild(&g_cfg);
+    }
+    unlock();
+
+    jb_init(&b);
+    jb_raw(&b, "{"); jb_kv_bool(&b, "ok", ok); jb_raw(&b, ",");
+    jb_kv_bool(&b, "running", p3_running()); jb_raw(&b, ",");
+    jb_kv_str(&b, "err", ok ? "" : err);
+    jb_raw(&b, "}");
+    return jret(&b);
+}
+
+char *pv_test(const char *req)
+{
+    const JVal *o; JVal *root = req_root(req, &o);
+    int id, port = 0; char host[ML_ADDR_LEN] = {0}, proxy[ML_ADDR_LEN] = {0};
+    char login[ML_LOGIN_LEN] = {0}, pass[ML_PASS_LEN] = {0};
+    char exit_ip[ML_ADDR_LEN] = {0}; BOOL huawei = FALSE, have = FALSE;
+    HttpResp r; JBuf b;
+
+    id = (o && o->type == J_NUM) ? (int)o->num : 0;
+
+    lock();
+    { Modem *m = cfg_find_by_id(&g_cfg, id);
+      if (m) {
+          have = TRUE;
+          port = m->proxy_port;
+          ml_strlcpy(host,  m->modem_ip, sizeof(host));
+          ml_strlcpy(login, m->login,    sizeof(login));
+          ml_strlcpy(pass,  m->pass,     sizeof(pass));
+          ml_strlcpy(proxy, g_cfg.lan_ip[0] ? g_cfg.lan_ip : "127.0.0.1", sizeof(proxy));
+      }
+    }
+    unlock();
+    json_free(root);
+
+    if (have && ml_port_valid(port) && p3_running()) {
+        /* Exit IP as seen from outside, through this modem's own port — proves
+         * -e pinned the right LTE interface. */
+        if (http_get_via_proxy("http://api.ipify.org", proxy, port, login, pass, 9000, &r)
+            && r.status == 200 && r.body) {
+            char *p = r.body, *w = exit_ip;
+            while (*p == ' ' || *p == '\n' || *p == '\r') p++;
+            while (*p && *p != '\n' && *p != '\r' &&
+                   (size_t)(w - exit_ip) < sizeof(exit_ip) - 1) *w++ = *p++;
+            *w = 0;
+        }
+        http_free(&r);
+
+        if (host[0]) {
+            char url[ML_URL_LEN];
+            snprintf(url, sizeof(url), "http://%s/api/webserver/SesTokInfo", host);
+            if (http_get_via_proxy(url, proxy, port, login, pass, 8000, &r)
+                && r.body && strstr(r.body, "SesInfo")) huawei = TRUE;
+            http_free(&r);
+        }
+    }
+
+    /* Cache the last exit IP so a state refresh shows it too. */
+    if (ml_is_ipv4(exit_ip)) {
+        lock();
+        { Modem *m = cfg_find_by_id(&g_cfg, id);
+          if (m) ml_strlcpy(m->last_exit_ip, exit_ip, sizeof(m->last_exit_ip)); }
+        unlock();
+    }
+
+    jb_init(&b);
+    jb_raw(&b, "{");
+    jb_kv_int(&b, "id", id); jb_raw(&b, ",");
+    jb_kv_bool(&b, "ok", ml_is_ipv4(exit_ip)); jb_raw(&b, ",");
+    jb_kv_str(&b, "exit_ip", exit_ip); jb_raw(&b, ",");
+    jb_kv_bool(&b, "huawei", huawei); jb_raw(&b, ",");
+    jb_kv_str(&b, "err", have ? (p3_running() ? "" : "3proxy не запущен") : "модем не найден");
+    jb_raw(&b, "}");
+    return jret(&b);
+}
+
+char *pv_reconnect(const char *req)
+{
+    const JVal *o; JVal *root = req_root(req, &o);
+    int id; char host[ML_ADDR_LEN] = {0}, msg[256] = {0}; double secs = 0; BOOL ok = FALSE, have = FALSE;
+    JBuf b; char t[80];
+
+    id = (o && o->type == J_NUM) ? (int)o->num : 0;
+    lock();
+    { Modem *m = cfg_find_by_id(&g_cfg, id);
+      if (m && m->modem_ip[0]) { have = TRUE; ml_strlcpy(host, m->modem_ip, sizeof(host)); } }
+    unlock();
+    json_free(root);
+
+    if (have) ok = hilink_reconnect(host, msg, sizeof(msg), &secs);
+    else ml_strlcpy(msg, "не задан IP модема", sizeof(msg));
+
+    jb_init(&b);
+    jb_raw(&b, "{");
+    jb_kv_int(&b, "id", id); jb_raw(&b, ",");
+    jb_kv_bool(&b, "ok", ok); jb_raw(&b, ",");
+    jb_kv_str(&b, "msg", msg); jb_raw(&b, ",");
+    snprintf(t, sizeof(t), "\"secs\":%.1f", secs); jb_raw(&b, t);
+    jb_raw(&b, "}");
+    return jret(&b);
+}
+
+char *pv_reboot(const char *req)
+{
+    const JVal *o; JVal *root = req_root(req, &o);
+    int id; char host[ML_ADDR_LEN] = {0}, msg[256] = {0}; BOOL ok = FALSE, have = FALSE;
+    JBuf b;
+
+    id = (o && o->type == J_NUM) ? (int)o->num : 0;
+    lock();
+    { Modem *m = cfg_find_by_id(&g_cfg, id);
+      if (m && m->modem_ip[0]) { have = TRUE; ml_strlcpy(host, m->modem_ip, sizeof(host)); } }
+    unlock();
+    json_free(root);
+
+    if (have) ok = hilink_reboot(host, msg, sizeof(msg));
+    else ml_strlcpy(msg, "не задан IP модема", sizeof(msg));
+
+    jb_init(&b);
+    jb_raw(&b, "{");
+    jb_kv_int(&b, "id", id); jb_raw(&b, ",");
+    jb_kv_bool(&b, "ok", ok); jb_raw(&b, ",");
+    jb_kv_str(&b, "msg", msg);
+    jb_raw(&b, "}");
+    return jret(&b);
+}
