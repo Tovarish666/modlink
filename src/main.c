@@ -9,6 +9,8 @@
 #include <winsock2.h>
 #include <shellapi.h>
 
+void tunnel_shutdown(void);
+
 extern int g_start_agent;   /* из ui_main: стартовать на вкладке агента */
 
 static BOOL is_elevated(void)
@@ -78,6 +80,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nCmdShow)
     if (!agent) p3_extract_binary();
 
     rc = ui_run(hInst, nCmdShow);
+    tunnel_shutdown();   /* корректно погасить lwIP и поток-петлю */
 
     ml_log("---- modlink exiting ----");
     WSACleanup();

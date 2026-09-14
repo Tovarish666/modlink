@@ -97,6 +97,16 @@ static HANDLE          g_stop_ev = NULL;
  * WSAEnumNetworkEvents при обходе. */
 static WSAEVENT        g_sock_ev = WSA_INVALID_EVENT;
 static volatile LONG   g_stop = 0;
+/* Ядро lwIP поднимается один раз на процесс: повторный lwip_init() затирает
+ * его пулы и валит ассертом. Дальше «Применить» — это переконфигурация набора
+ * интерфейсов, и делается она НА ПОТОКЕ-ПЕТЛЕ (в NO_SYS все вызовы lwIP обязаны
+ * идти из одного потока). */
+static BOOL            g_core_up = FALSE;
+static HANDLE          g_reconf_ev = NULL;     /* сигнал петле: пересобрать */
+static HANDLE          g_reconf_done = NULL;   /* петля: готово */
+static CRITICAL_SECTION g_reconf_cs;
+static TunnelCfg       g_pending[TUNNEL_MAX_IFACES];
+static int             g_pending_n = 0;
 static struct tcp_pcb *g_listener = NULL;
 
 /* ------------------------------------------------------------ DNS
@@ -713,6 +723,51 @@ static void handle_socket_events(void)
     }
 }
 
+static BOOL iface_up(Iface *f, const TunnelCfg *cfg, char *err, size_t errcap);
+
+/* Снять один интерфейс: сначала опустить netif в lwIP, потом закрыть TAP.
+ * Всё строго на потоке-петле. */
+static void iface_down(Iface *f)
+{
+    if (!f->used) return;
+    if (f->pending) { tap_read_cancel(f->tap, &f->ov); f->pending = FALSE; }
+    netif_set_link_down(&f->netif);
+    netif_set_down(&f->netif);
+    netif_remove(&f->netif);
+    if (f->ov.hEvent) { CloseHandle(f->ov.hEvent); f->ov.hEvent = NULL; }
+    if (f->tap != INVALID_HANDLE_VALUE) { tap_close(f->tap); f->tap = INVALID_HANDLE_VALUE; }
+    f->used = FALSE;
+}
+
+/* Пересборка набора интерфейсов на потоке-петле: закрыть все соединения и
+ * снять текущие netif'ы, затем поднять новые из g_pending. Слушатель и udp-pcb
+ * переживают пересборку (порт 0 + ACCEPT_ANY), их не трогаем. */
+static void do_reconfigure(void)
+{
+    int i;
+
+    for (i = 0; i < MAX_CONNS; i++) conn_kill(&g_conns[i]);
+    for (i = 0; i < MAX_DNSQ;  i++) dnsq_free(&g_dns[i]);
+    for (i = 0; i < g_niface; i++) iface_down(&g_ifaces[i]);
+    g_niface = 0;
+
+    EnterCriticalSection(&g_reconf_cs);
+    for (i = 0; i < g_pending_n; i++) {
+        char e[256];
+        if (iface_up(&g_ifaces[g_niface], &g_pending[i], e, sizeof(e))) {
+            ml_log("tunnel[%s]: %s на %s -> SOCKS5 %s:%d", g_pending[i].label,
+                   g_pending[i].virt_ip, g_pending[i].guid,
+                   g_pending[i].proxy_ip, g_pending[i].proxy_port);
+            g_niface++;
+        } else {
+            ml_log("tunnel[%s]: не поднят — %s", g_pending[i].label, e);
+        }
+    }
+    LeaveCriticalSection(&g_reconf_cs);
+    if (g_niface > 0) netif_set_default(&g_ifaces[0].netif);
+    ml_log("tunnel: пересобрано, интерфейсов %d", g_niface);
+}
+
 static DWORD WINAPI loop_thread(LPVOID arg)
 {
     /* Ждём: [0] остановка, [1] события всех сокетов, дальше по одному
@@ -729,8 +784,9 @@ static DWORD WINAPI loop_thread(LPVOID arg)
         /* Держим по одному чтению в очереди на каждый интерфейс. Пока все
          * висят, поток спит. */
         nwait = 0;
-        wait[nwait++] = g_stop_ev;
-        wait[nwait++] = (HANDLE)g_sock_ev;
+        wait[nwait++] = g_stop_ev;      /* 0: финальная остановка */
+        wait[nwait++] = g_reconf_ev;    /* 1: пересобрать интерфейсы */
+        wait[nwait++] = (HANDLE)g_sock_ev; /* 2: события сокетов */
         for (i = 0; i < g_niface; i++) {
             Iface *f = &g_ifaces[i];
             if (!f->used) continue;
@@ -744,7 +800,7 @@ static DWORD WINAPI loop_thread(LPVOID arg)
                 f->pending = TRUE;
                 if (done) SetEvent(f->ov.hEvent);
             }
-            map[nwait - 2] = i;
+            map[nwait - 3] = i;
             wait[nwait++] = f->ov.hEvent;
         }
 
@@ -753,15 +809,19 @@ static DWORD WINAPI loop_thread(LPVOID arg)
         else if (timeout > 1000) timeout = 1000;
 
         w = WaitForMultipleObjects((DWORD)nwait, wait, FALSE, timeout);
-        if (w == WAIT_OBJECT_0) break;                      /* остановка */
+        if (w == WAIT_OBJECT_0) break;                      /* финальная остановка */
 
-        if (w == WAIT_OBJECT_0 + 1) {
-            /* Событие сокетов общее, поэтому сбрасываем его сами и перечисляем
-             * с NULL — иначе WSAEnumNetworkEvents сбросит его за нас и сигнал,
-             * пришедший во время обхода, потеряется. */
+        if (w == WAIT_OBJECT_0 + 1) {                       /* пересобрать */
+            ResetEvent(g_reconf_ev);
+            do_reconfigure();
+            SetEvent(g_reconf_done);
+            continue;                                       /* массив ожидания устарел */
+        } else if (w == WAIT_OBJECT_0 + 2) {
+            /* Событие сокетов общее — сбрасываем сами и перечисляем с NULL,
+             * иначе сигнал во время обхода потеряется. */
             WSAResetEvent(g_sock_ev);
-        } else if (w > WAIT_OBJECT_0 + 1 && w < WAIT_OBJECT_0 + (DWORD)nwait) {
-            Iface *f = &g_ifaces[map[w - WAIT_OBJECT_0 - 2]];
+        } else if (w > WAIT_OBJECT_0 + 2 && w < WAIT_OBJECT_0 + (DWORD)nwait) {
+            Iface *f = &g_ifaces[map[w - WAIT_OBJECT_0 - 3]];
             int got = 0;
             f->pending = FALSE;
             if (!tap_read_end(f->tap, &f->ov, &got)) {
@@ -828,47 +888,26 @@ static BOOL iface_up(Iface *f, const TunnelCfg *cfg, char *err, size_t errcap)
     return TRUE;
 }
 
-BOOL tunnel_start(const TunnelCfg *cfgs, int count, char *err, size_t errcap)
+/* Поднять ядро lwIP один раз: пулы, слушатель-ловушка, udp-приёмник DNS и
+ * постоянный поток-петля. Всё это переживает любое число «Применить». */
+static BOOL ensure_core(char *err, size_t errcap)
 {
     struct tcp_pcb *pcb;
-    int i, up = 0;
 
-    if (err && errcap) err[0] = 0;
-    if (count <= 0) {
-        if (err) ml_strlcpy(err, "список интерфейсов пуст", errcap);
-        return FALSE;
-    }
-    if (count > TUNNEL_MAX_IFACES) count = TUNNEL_MAX_IFACES;
+    if (g_core_up) return TRUE;
 
     g_sock_ev = WSACreateEvent();
     if (g_sock_ev == WSA_INVALID_EVENT) {
         if (err) ml_strlcpy(err, "не удалось создать событие сокетов", errcap);
         return FALSE;
     }
+    InitializeCriticalSection(&g_reconf_cs);
+    g_stop_ev     = CreateEventA(NULL, TRUE, FALSE, NULL);
+    g_reconf_ev   = CreateEventA(NULL, TRUE, FALSE, NULL);   /* ручной сброс */
+    g_reconf_done = CreateEventA(NULL, FALSE, FALSE, NULL);  /* авто-сброс */
 
     lwip_init();
 
-    for (i = 0; i < count; i++) {
-        char e[256];
-        if (iface_up(&g_ifaces[g_niface], &cfgs[i], e, sizeof(e))) {
-            ml_log("tunnel[%s]: %s на %s -> SOCKS5 %s:%d",
-                   cfgs[i].label, cfgs[i].virt_ip, cfgs[i].guid,
-                   cfgs[i].proxy_ip, cfgs[i].proxy_port);
-            g_niface++;
-            up++;
-        } else {
-            /* Один занятый адаптер не должен лишать связи остальные. */
-            ml_log("tunnel[%s]: не поднят — %s", cfgs[i].label, e);
-        }
-    }
-    if (!up) {
-        if (err) ml_strlcpy(err, "не удалось поднять ни одного интерфейса", errcap);
-        return FALSE;
-    }
-    netif_set_default(&g_ifaces[0].netif);
-
-    /* Слушатель-ловушка один на все интерфейсы: порт 0 — условная метка
-     * «любой порт», её понимает наша правка в tcp_in.c. */
     pcb = tcp_new();
     if (!pcb) { if (err) ml_strlcpy(err, "нет памяти под pcb", errcap); return FALSE; }
     tcp_bind(pcb, IP_ANY_TYPE, 9);
@@ -878,11 +917,9 @@ BOOL tunnel_start(const TunnelCfg *cfgs, int count, char *err, size_t errcap)
         tcp_abort(pcb);
         return FALSE;
     }
-    g_listener->local_port = 0;
+    g_listener->local_port = 0;   /* «любой порт» — метка для правки в tcp_in.c */
     tcp_accept(g_listener, lw_accept);
 
-    /* DNS: udp_input сопоставляет pcb по порту, а адрес уже принят флагом
-     * ACCEPT_ANY — один pcb на порту 53 ловит запросы со всех интерфейсов. */
     g_udp = udp_new();
     if (g_udp) {
         udp_bind(g_udp, IP_ANY_TYPE, 53);
@@ -890,14 +927,45 @@ BOOL tunnel_start(const TunnelCfg *cfgs, int count, char *err, size_t errcap)
     }
 
     g_stop = 0;
-    g_stop_ev = CreateEventA(NULL, TRUE, FALSE, NULL);
-    g_thread  = CreateThread(NULL, 0, loop_thread, NULL, 0, NULL);
+    g_thread = CreateThread(NULL, 0, loop_thread, NULL, 0, NULL);
     if (!g_thread) {
         if (err) ml_strlcpy(err, "не удалось создать поток петли", errcap);
         return FALSE;
     }
+    g_core_up = TRUE;
+    return TRUE;
+}
 
-    ml_log("tunnel: поднято интерфейсов %d из %d", up, count);
+/* Отдать петле новый набор интерфейсов и дождаться, пока она его применит.
+ * Сам netif_add/netif_remove делает петля — здесь только передача. */
+static BOOL submit_reconfigure(const TunnelCfg *cfgs, int count, char *err, size_t errcap)
+{
+    int i;
+    if (count > TUNNEL_MAX_IFACES) count = TUNNEL_MAX_IFACES;
+    EnterCriticalSection(&g_reconf_cs);
+    for (i = 0; i < count; i++) g_pending[i] = cfgs[i];
+    g_pending_n = count;
+    LeaveCriticalSection(&g_reconf_cs);
+
+    SetEvent(g_reconf_ev);
+    if (WaitForSingleObject(g_reconf_done, 30000) != WAIT_OBJECT_0) {
+        if (err) ml_strlcpy(err, "переконфигурация не завершилась за 30с", errcap);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+BOOL tunnel_start(const TunnelCfg *cfgs, int count, char *err, size_t errcap)
+{
+    if (err && errcap) err[0] = 0;
+    if (count <= 0) { if (err) ml_strlcpy(err, "список интерфейсов пуст", errcap); return FALSE; }
+    if (!ensure_core(err, errcap)) return FALSE;
+    if (!submit_reconfigure(cfgs, count, err, errcap)) return FALSE;
+    if (g_niface == 0) {
+        if (err) ml_strlcpy(err, "не удалось поднять ни одного интерфейса", errcap);
+        return FALSE;
+    }
+    ml_log("tunnel: применено, интерфейсов %d", g_niface);
     return TRUE;
 }
 
@@ -905,22 +973,26 @@ int tunnel_iface_count(void) { return g_niface; }
 
 void tunnel_stop(void)
 {
-    int i;
-    if (!g_thread) return;
+    /* Снять все интерфейсы, но оставить ядро и петлю живыми — так следующий
+     * «Применить» не переинициализирует lwIP (в этом была причина падений). */
+    if (!g_core_up) return;
+    submit_reconfigure(NULL, 0, NULL, 0);
+}
+
+/* Полная остановка при выходе из приложения. */
+void tunnel_shutdown(void)
+{
+    if (!g_core_up) return;
+    submit_reconfigure(NULL, 0, NULL, 0);
     InterlockedExchange(&g_stop, 1);
-    if (g_stop_ev) SetEvent(g_stop_ev);      /* будим петлю, а не ждём таймаута */
+    if (g_stop_ev) SetEvent(g_stop_ev);
     WaitForSingleObject(g_thread, 5000);
-    CloseHandle(g_thread);
-    g_thread = NULL;
-
-    for (i = 0; i < g_niface; i++) {
-        Iface *f = &g_ifaces[i];
-        if (f->ov.hEvent) { CloseHandle(f->ov.hEvent); f->ov.hEvent = NULL; }
-        if (f->tap != INVALID_HANDLE_VALUE) { tap_close(f->tap); f->tap = INVALID_HANDLE_VALUE; }
-        f->used = FALSE;
-    }
-    g_niface = 0;
-
-    if (g_stop_ev) { CloseHandle(g_stop_ev); g_stop_ev = NULL; }
+    CloseHandle(g_thread); g_thread = NULL;
+    if (g_stop_ev)   { CloseHandle(g_stop_ev);   g_stop_ev = NULL; }
+    if (g_reconf_ev) { CloseHandle(g_reconf_ev); g_reconf_ev = NULL; }
+    if (g_reconf_done){ CloseHandle(g_reconf_done); g_reconf_done = NULL; }
     if (g_sock_ev != WSA_INVALID_EVENT) { WSACloseEvent(g_sock_ev); g_sock_ev = WSA_INVALID_EVENT; }
+    DeleteCriticalSection(&g_reconf_cs);
+    g_core_up = FALSE;
+    g_niface = 0;
 }

@@ -37,6 +37,7 @@ typedef struct {
  * если не поднялся ни один. */
 BOOL tunnel_start(const TunnelCfg *cfgs, int count, char *err, size_t errcap);
 void tunnel_stop(void);
+void tunnel_shutdown(void);
 
 int  tunnel_iface_count(void);
 void tunnel_stats(int *active, int *total, unsigned long long *bytes_up,
