@@ -147,24 +147,28 @@ BOOL hilink_reconnect(const char *host, char *msg, size_t msgcap, double *secs)
         goto fail;
     }
 
-    /* 4. wait for the device to confirm it is back up */
-    for (i = 0; i < 20; i++) {
-        char url[ML_URL_LEN];
-        HttpResp r;
-        BOOL up;
-        Sleep(400);
-        snprintf(url, sizeof(url), "http://%s/api/dialup/mobile-dataswitch", host);
-        up = http_get(url, HL_TIMEOUT, &r) && r.body &&
-             strstr(r.body, "<dataswitch>1</dataswitch>") != NULL;
-        http_free(&r);
-        if (up) {
-            QueryPerformanceCounter(&t1);
-            if (secs) *secs = (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
-            if (msg) ml_strlcpy(msg, "reconnected", msgcap);
-            return TRUE;
+    /* 4. Data-on was accepted, so the reconnect has been issued — that alone is
+     *    success (the exit IP changes even when the status endpoint is slow to
+     *    report dataswitch=1). Poll only to confirm and to measure the time;
+     *    never turn a reconnect the modem actually performed into an error. */
+    {
+        BOOL confirmed = FALSE;
+        for (i = 0; i < 30; i++) {
+            char url[ML_URL_LEN];
+            HttpResp r;
+            Sleep(400);
+            snprintf(url, sizeof(url), "http://%s/api/dialup/mobile-dataswitch", host);
+            confirmed = http_get(url, HL_TIMEOUT, &r) && r.body &&
+                        strstr(r.body, "<dataswitch>1</dataswitch>") != NULL;
+            http_free(&r);
+            if (confirmed) break;
         }
+        QueryPerformanceCounter(&t1);
+        if (secs) *secs = (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
+        if (msg) ml_strlcpy(msg, confirmed ? "переподключено"
+                                           : "переподключено (статус не подтверждён)", msgcap);
+        return TRUE;
     }
-    if (msg) ml_strlcpy(msg, "dataswitch не подтверждён", msgcap);
 
 fail:
     QueryPerformanceCounter(&t1);

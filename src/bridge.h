@@ -22,6 +22,7 @@ void  pv_shutdown(void);
 /* --- read (req ignored, kept for a uniform binding signature) --------- */
 char *pv_get_state(const char *req);   /* {network:{...}, modems:[...], running} */
 char *pv_status(const char *req);      /* {running:bool} — cheap poll            */
+char *pv_clip(const char *req);        /* req[0] = text -> Windows clipboard      */
 
 /* --- mutate (fast, run on the UI thread) ------------------------------ */
 char *pv_save_network(const char *req);/* req[0] = {lan_ip, base_port}  -> state */

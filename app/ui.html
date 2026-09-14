@@ -137,6 +137,11 @@ input::placeholder{color:var(--tx3)}
 .toast .bar{width:3px;align-self:stretch;border-radius:3px;background:var(--acc);flex-shrink:0}
 .toast.ok .bar{background:var(--ok)} .toast.err .bar{background:var(--danger)}
 @keyframes tin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.menu{position:absolute;right:0;top:calc(100% + 6px);background:#17171c;border:1px solid var(--line2);
+  border-radius:10px;padding:5px;min-width:220px;z-index:20;box-shadow:0 14px 34px -14px rgba(0,0,0,.75)}
+.menu button{display:block;width:100%;text-align:left;background:none;border:none;color:var(--tx);
+  font-family:inherit;font-size:12.5px;padding:8px 10px;border-radius:7px;cursor:pointer;transition:background .14s var(--ease)}
+.menu button:hover{background:rgba(255,255,255,.06)}
 .view{display:none} .view.on{display:block}
 .spin{animation:sp 1s linear infinite} @keyframes sp{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
@@ -203,6 +208,15 @@ input::placeholder{color:var(--tx3)}
       <div class="sechead">
         <h2>Модемы</h2><span id="modCount" class="count">0</span>
         <span class="sp"></span>
+        <div style="position:relative">
+          <button id="btnCopyAll" class="btn">
+            <svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>Копировать</button>
+          <div id="copyMenu" class="menu" hidden>
+            <button data-copy="both">Прокси + реконнекты</button>
+            <button data-copy="proxy">Только прокси</button>
+            <button data-copy="reconn">Только реконнекты</button>
+          </div>
+        </div>
         <button id="btnAdd" class="btn acc">
           <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Модем</button>
       </div>
@@ -393,6 +407,10 @@ function bindEvents(){
   $("#btnAdd").onclick=addModem;
   $("#btnApply").onclick=apply;
   $("#btnStop").onclick=stop;
+  const menu=$("#copyMenu");
+  $("#btnCopyAll").onclick=e=>{ e.stopPropagation(); menu.hidden=!menu.hidden; };
+  menu.addEventListener("click",e=>{ const b=e.target.closest("[data-copy]"); if(!b)return; menu.hidden=true; doCopyAll(b.dataset.copy); });
+  document.addEventListener("click",()=>{ menu.hidden=true; });
 }
 
 async function addModem(){ ST=await api("pv_add_modem"); render();
@@ -441,12 +459,26 @@ async function doReboot(id){
   try{ const r=await api("pv_reboot",id); toast((r.ok?"Ребут отправлен: ":"Ошибка: ")+(r.msg||""),r.ok?"ok":"err"); }
   catch(e){ toast(String(e.message||e),"err"); }
 }
+function cliIP(){ return ST.network.wan_ip||ST.network.lan_ip||"IP"; }
+function proxyLine(m){ return `${cliIP()}:${m.proxy_port}:${m.login}:${m.pass}`; }
+function reconnLine(m){ return `http://${cliIP()}:${m.reconn_port}/reconnect`; }
+async function copyText(text){ try{ const r=await api("pv_clip",text); return !!(r&&r.ok); }catch(e){ return false; } }
 async function doCopy(id){
   const m=ST.modems.find(x=>x.id===id); if(!m) return;
-  const ip=ST.network.wan_ip||ST.network.lan_ip||"IP";
-  const line=`${ip}:${m.proxy_port}:${m.login}:${m.pass}`;
-  try{ await navigator.clipboard.writeText(line); toast("Скопировано: "+line,"ok"); }
-  catch(e){ toast(line); }
+  const line=proxyLine(m);
+  const ok=await copyText(line);
+  toast(ok?("Скопировано: "+line):"Не удалось скопировать",ok?"ok":"err");
+}
+async function doCopyAll(mode){
+  const ms=ST.modems;
+  if(!ms.length){ toast("Список модемов пуст"); return; }
+  const prox=ms.map(proxyLine), rec=ms.map(reconnLine);
+  let text,cnt;
+  if(mode==="proxy"){ text=prox.join("\n"); cnt=prox.length; }
+  else if(mode==="reconn"){ text=rec.join("\n"); cnt=rec.length; }
+  else { text=prox.join("\n")+"\n\n"+rec.join("\n"); cnt=prox.length+rec.length; }
+  const ok=await copyText(text);
+  toast(ok?("Скопировано строк: "+cnt):"Не удалось скопировать",ok?"ok":"err");
 }
 
 /* ---- boot (wait until bridge is injected) ---- */

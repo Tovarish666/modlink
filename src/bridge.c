@@ -115,6 +115,39 @@ char *pv_status(const char *req)
     return jret(&b);
 }
 
+/* Put text on the Windows clipboard from C — navigator.clipboard is blocked in
+ * the WebView's opaque (NavigateToString) origin, so copying is done host-side. */
+char *pv_clip(const char *req)
+{
+    const JVal *o; JVal *root = req_root(req, &o);
+    const char *text = (o && o->type == J_STR && o->str) ? o->str : "";
+    BOOL ok = FALSE;
+    JBuf b;
+
+    if (OpenClipboard(NULL)) {
+        wchar_t *w = ml_utf8_to_w(text);
+        EmptyClipboard();
+        if (w) {
+            size_t bytes = (wcslen(w) + 1) * sizeof(wchar_t);
+            HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if (h) {
+                void *p = GlobalLock(h);
+                if (p) {
+                    memcpy(p, w, bytes);
+                    GlobalUnlock(h);
+                    if (SetClipboardData(CF_UNICODETEXT, h)) ok = TRUE;
+                    else GlobalFree(h);
+                } else GlobalFree(h);
+            }
+            free(w);
+        }
+        CloseClipboard();
+    }
+    json_free(root);
+    jb_init(&b); jb_raw(&b, "{"); jb_kv_bool(&b, "ok", ok); jb_raw(&b, "}");
+    return jret(&b);
+}
+
 /* ------------------------------------------------------------- mutate */
 char *pv_save_network(const char *req)
 {
