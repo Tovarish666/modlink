@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ProxyVeth</title>
+<title>modlink</title>
 <style>
 :root{
   --bg:#050505; --rail:#09090b; --content:#0b0b0d; --card:#121216; --inset:#0e0e12;
@@ -150,7 +150,7 @@ input::placeholder{color:var(--tx3)}
 <body>
 
 <nav class="rail">
-  <div class="brand"><span class="dot"></span><b>ProxyVeth</b></div>
+  <div class="brand"><span class="dot"></span><b>modlink</b></div>
   <div class="nav on" data-view="server">
     <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><circle cx="7" cy="7.5" r=".6"/><circle cx="7" cy="16.5" r=".6"/></svg>
     Сервер
@@ -162,7 +162,7 @@ input::placeholder{color:var(--tx3)}
   <div class="foot">
     <span id="railStatus" class="st"><i></i><span id="railStatusText">остановлен</span></span><br>
     <span id="railMeta">модемов 0</span><br>
-    <span style="color:var(--tx3)">ProxyVeth 2.0</span>
+    <span style="color:var(--tx3)">modlink 2.0</span>
   </div>
 </nav>
 
@@ -484,7 +484,7 @@ async function doCopyAll(mode){
 /* ---- boot (wait until bridge is injected) ---- */
 async function boot(tries){
   if(typeof window.pv_get_state!=="function"){
-    if(tries>50){ document.body.innerHTML="<p style='padding:2rem;font:14px sans-serif'>Мост UI недоступен — запусти через ProxyVeth.exe</p>"; return; }
+    if(tries>50){ document.body.innerHTML="<p style='padding:2rem;font:14px sans-serif'>Мост UI недоступен — запусти через modlink.exe</p>"; return; }
     return setTimeout(()=>boot((tries||0)+1),60);
   }
   try{ ST=await api("pv_get_state"); }catch(e){ ST.modems=[]; }

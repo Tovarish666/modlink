@@ -2,7 +2,7 @@
 
 1 RT_MANIFEST "app.manifest"
 
-/* 3proxy.exe — dropped to %LOCALAPPDATA%\ProxyVeth\bin on first run.
+/* 3proxy.exe — dropped to %LOCALAPPDATA%\modlink\bin on first run.
  * tools/fetch-3proxy.ps1 places res\3proxy.exe here before the build. */
 101 RCDATA "3proxy.exe"
 
@@ -19,9 +19,9 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
-      VALUE "FileDescription", "ProxyVeth - LTE modem proxy panel"
+      VALUE "FileDescription", "modlink - LTE modem proxy panel"
       VALUE "FileVersion",     "2.0.0.0"
-      VALUE "ProductName",     "ProxyVeth"
+      VALUE "ProductName",     "modlink"
       VALUE "ProductVersion",  "2.0.0.0"
       VALUE "Comments",        "Bundles 3proxy (c) Vladimir Dubrovin, BSD-style license; UI via webview (c) Serge Zaitsev / Steffen Langnes, MIT - see THIRD-PARTY.txt"
     END

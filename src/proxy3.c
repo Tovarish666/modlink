@@ -139,29 +139,46 @@ BOOL p3_write_config(const Config *c, char *err, size_t errcap)
     }
     jb_raw(&b, "\n\n");
 
-    for (i = 0; i < c->count; i++) {
-        const Modem *m = &c->modems[i];
-        if (!m->enabled || !m->login[0] || !ml_port_valid(m->proxy_port)) continue;
+    /* Several modems may share one port: the exit is then chosen by the login.
+     * 3proxy can't bind a port twice, and -e is per-service, so per-modem
+     * outbound is done per-user instead — `allow <login>` + `parent 1000 extip
+     * <lan_ip> 0` sets the outgoing source address for that user's ACL (see the
+     * 3proxy manual: extip "sets the external address for this request", chosen
+     * by ACL). One `auto -pPORT` fronts all modems on that port.
+     *   -i is the host's own address, shared by every service (3proxy warns
+     *   against 0.0.0.0). SO_EXCLUSIVEADDRUSE stops another local process from
+     *   stealing the port (Windows does not set SO_REUSEADDR here). */
+    {
+        char done[ML_MAX_MODEMS];
+        int k;
+        memset(done, 0, sizeof(done));
+        for (i = 0; i < c->count; i++) {
+            const Modem *m = &c->modems[i];
+            int port;
+            if (!m->enabled || !m->login[0] || !ml_port_valid(m->proxy_port)) continue;
+            if (done[i]) continue;
+            port = m->proxy_port;
 
-        jb_raw(&b, "flush\n");
-        jb_raw(&b, "allow ");
-        jb_raw(&b, m->login);
-        jb_raw(&b, "\n");
-
-        /* -p listen port, -i listen address, -e outbound bind address.
-         * -e is the modem's interface on this host: it is what actually pins
-         * this port's traffic to that LTE link.
-         * -i is the host's own address on the main network, shared by every
-         * service — 3proxy's docs warn against 0.0.0.0 because it also exposes
-         * the proxy on loopback and any other interface.
-         * SO_EXCLUSIVEADDRUSE stops another local process from stealing the
-         * port behind our back (Windows does not set SO_REUSEADDR here). */
-        snprintf(line, sizeof(line), "auto -p%d", m->proxy_port);
-        jb_raw(&b, line);
-        if (listen_ip[0])    { snprintf(line, sizeof(line), " -i%s", listen_ip);  jb_raw(&b, line); }
-        if (m->lan_ip[0])    { snprintf(line, sizeof(line), " -e%s", m->lan_ip);  jb_raw(&b, line); }
-        jb_raw(&b, " -olSO_EXCLUSIVEADDRUSE\n\n");
-        services++;
+            jb_raw(&b, "flush\n");
+            for (k = i; k < c->count; k++) {
+                const Modem *o = &c->modems[k];
+                if (!o->enabled || !o->login[0] || !ml_port_valid(o->proxy_port)) continue;
+                if (o->proxy_port != port) continue;
+                done[k] = 1;
+                jb_raw(&b, "allow ");
+                jb_raw(&b, o->login);
+                jb_raw(&b, "\n");
+                if (o->lan_ip[0]) {
+                    snprintf(line, sizeof(line), "parent 1000 extip %s 0\n", o->lan_ip);
+                    jb_raw(&b, line);
+                }
+            }
+            snprintf(line, sizeof(line), "auto -p%d", port);
+            jb_raw(&b, line);
+            if (listen_ip[0]) { snprintf(line, sizeof(line), " -i%s", listen_ip); jb_raw(&b, line); }
+            jb_raw(&b, " -olSO_EXCLUSIVEADDRUSE\n\n");
+            services++;
+        }
     }
 
     if (!services) {

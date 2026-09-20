@@ -84,6 +84,20 @@ void pv_init(void)
 {
     if (!g_ready) { InitializeCriticalSection(&g_lock); g_ready = TRUE; }
     ml_ensure_dirs();
+
+    /* One-time migration from the earlier "ProxyVeth" name: carry the config
+     * over so an existing install keeps its modems. */
+    {
+        const char *la = getenv("LOCALAPPDATA");
+        char oldcfg[ML_PATH_LEN];
+        if (la && GetFileAttributesA(ml_path_config()) == INVALID_FILE_ATTRIBUTES) {
+            snprintf(oldcfg, sizeof(oldcfg), "%s\\ProxyVeth\\config.json", la);
+            if (GetFileAttributesA(oldcfg) != INVALID_FILE_ATTRIBUTES &&
+                CopyFileA(oldcfg, ml_path_config(), FALSE))
+                ml_log("migrated config ProxyVeth -> modlink");
+        }
+    }
+
     p3_extract_binary();
     lock();
     if (!cfg_load(&g_cfg)) cfg_defaults(&g_cfg);

@@ -149,13 +149,15 @@ int cfg_validate(const Config *c, char *err, size_t errcap)
             snprintf(err, errcap, "Строка %d (%s): IP модема «%s» — не IPv4", i + 1, m->login, m->modem_ip);
             return i;
         }
-        /* Cross-row collisions. Hand-entered ports make these a real risk, so
-         * they are hard errors rather than something 3proxy discovers at bind. */
+        /* Cross-row collisions. A shared proxy port is now ALLOWED — several
+         * modems on one port are routed by login (3proxy extip per ACL). But the
+         * proxy port must not clash with someone's reconnect listener, reconnect
+         * ports must stay unique, and logins must be unique (they pick the exit). */
         for (j = 0; j < c->count; j++) {
             const Modem *o = &c->modems[j];
             if (j == i || !o->enabled) continue;
-            if (o->proxy_port == m->proxy_port || o->reconn_port == m->proxy_port) {
-                snprintf(err, errcap, "Порт %d занят дважды: строки %d и %d",
+            if (o->reconn_port == m->proxy_port) {
+                snprintf(err, errcap, "Порт %d: у строки %d это порт прокси, а у строки %d — порт реконнекта",
                          m->proxy_port, i + 1, j + 1);
                 return i;
             }

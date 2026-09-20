@@ -1,4 +1,4 @@
-/* ProxyVeth — WebView2 host.
+/* modlink — WebView2 host.
  *
  * The whole window is one WebView2 control rendering app/ui.html. There is no
  * owner-draw, no GDI, no theming code — the look lives entirely in HTML/CSS,
@@ -100,7 +100,7 @@ static char *load_ui_html()
 /* ---- single instance ------------------------------------------------- */
 static bool already_running()
 {
-    HANDLE mtx = CreateMutexA(nullptr, TRUE, "Global\\ProxyVeth_single_instance");
+    HANDLE mtx = CreateMutexA(nullptr, TRUE, "Global\\modlink_single_instance");
     if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND prev = FindWindowW(L"Chrome_WidgetWin_0", nullptr); /* best effort */
         if (prev) { if (IsIconic(prev)) ShowWindow(prev, SW_RESTORE); SetForegroundWindow(prev); }
@@ -125,12 +125,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nCmdShow)
         MessageBoxW(nullptr,
             L"Не удалось создать WebView2.\n\nНужен компонент «WebView2 Runtime» "
             L"(входит в Windows 10/11 и Microsoft Edge).",
-            L"ProxyVeth", MB_ICONERROR | MB_OK);
+            L"modlink", MB_ICONERROR | MB_OK);
         WSACleanup();
         return 1;
     }
 
-    webview_set_title(w, "ProxyVeth");
+    webview_set_title(w, "modlink");
     webview_set_size(w, 900, 560, WEBVIEW_HINT_MIN);
     webview_set_size(w, 1060, 700, WEBVIEW_HINT_NONE);
 

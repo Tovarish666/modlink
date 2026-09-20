@@ -1,5 +1,5 @@
 @echo off
-REM ProxyVeth - local build with the MSVC toolchain.
+REM modlink - local build with the MSVC toolchain.
 REM
 REM Needs "Visual Studio Build Tools" (free, "Desktop development with C++").
 REM Run from an "x64 Native Tools Command Prompt for VS", or let the block below
@@ -70,7 +70,7 @@ cl.exe /nologo /W3 /O2 /MT /EHsc /utf-8 /DUNICODE /D_UNICODE ^
    src\util.c src\json.c src\config.c src\proxy3.c src\net.c ^
    src\hilink.c src\reconn.c src\bridge.c ^
    build\proxyveth.res ^
-   /link /SUBSYSTEM:WINDOWS /OUT:build\proxyveth.exe ^
+   /link /SUBSYSTEM:WINDOWS /OUT:build\modlink.exe ^
    user32.lib gdi32.lib ole32.lib oleaut32.lib shlwapi.lib version.lib ^
    advapi32.lib shell32.lib winhttp.lib ws2_32.lib
 
@@ -81,5 +81,5 @@ if errorlevel 1 (
 )
 
 echo.
-echo   OK: build\proxyveth.exe
+echo   OK: build\modlink.exe
 dir /b build\*.exe
