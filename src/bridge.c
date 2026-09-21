@@ -28,6 +28,90 @@ static void derive_gateway(const char *iface_ip, char *out, size_t cap)
     else if (cap) out[0] = 0;
 }
 
+/* ------------------------------------------------- background worker control
+ * The engine (3proxy + reconnect + watchdog) lives in a separate windowless
+ * process, modlink.exe --worker, so it survives the GUI window closing. The GUI
+ * only saves config.json and drives the worker: spawn it, signal reload/quit,
+ * and read its status.json. */
+#define EV_RELOAD "Local\\modlink_reload"
+#define EV_QUIT   "Local\\modlink_quit"
+#define MTX_WORK  "Local\\modlink_worker_mtx"
+
+static BOOL worker_alive(void)
+{
+    HANDLE m = OpenMutexA(SYNCHRONIZE, FALSE, MTX_WORK);
+    if (m) { CloseHandle(m); return TRUE; }
+    return FALSE;
+}
+
+static void worker_spawn(void)
+{
+    char self[ML_PATH_LEN], cmd[ML_PATH_LEN + 16];
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
+    if (worker_alive()) return;
+    if (!GetModuleFileNameA(NULL, self, sizeof(self))) return;
+    snprintf(cmd, sizeof(cmd), "\"%s\" --worker", self);
+    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+}
+
+static void worker_signal(const char *name)
+{
+    HANDLE e = OpenEventA(EVENT_MODIFY_STATE, FALSE, name);
+    if (e) { SetEvent(e); CloseHandle(e); }
+}
+
+/* Read the worker's status.json. A file older than ~10 s means the worker is
+ * gone (it rewrites status every few seconds), so treat that as stopped. */
+static BOOL svc_running(void)
+{
+    char path[ML_PATH_LEN], *buf = NULL; size_t len = 0; BOOL r = FALSE;
+    WIN32_FILE_ATTRIBUTE_DATA fad; FILETIME now; ULONGLONG age;
+    snprintf(path, sizeof(path), "%s\\status.json", ml_dir_data());
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return FALSE;
+    GetSystemTimeAsFileTime(&now);
+    age = ((((ULONGLONG)now.dwHighDateTime) << 32) | now.dwLowDateTime)
+        - ((((ULONGLONG)fad.ftLastWriteTime.dwHighDateTime) << 32) | fad.ftLastWriteTime.dwLowDateTime);
+    if (age > 100000000ULL) return FALSE;
+    if (ml_read_file(path, &buf, &len) && buf) { r = strstr(buf, "\"running\":true") != NULL; free(buf); }
+    return r;
+}
+
+static void svc_read_err(char *out, size_t cap)
+{
+    char path[ML_PATH_LEN], *buf = NULL; size_t len = 0;
+    if (out && cap) out[0] = 0;
+    snprintf(path, sizeof(path), "%s\\status.json", ml_dir_data());
+    if (ml_read_file(path, &buf, &len) && buf) {
+        JVal *root = json_parse(buf);
+        if (root) { ml_strlcpy(out, json_str(root, "err", ""), cap); json_free(root); }
+        free(buf);
+    }
+}
+
+/* Keep the HKCU Run entry in sync so the worker autostarts at logon. */
+static void sync_autostart(BOOL on)
+{
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS)
+        return;
+    if (on) {
+        char self[ML_PATH_LEN], val[ML_PATH_LEN + 16];
+        if (GetModuleFileNameA(NULL, self, sizeof(self))) {
+            snprintf(val, sizeof(val), "\"%s\" --worker", self);
+            RegSetValueExA(k, "modlink", 0, REG_SZ, (const BYTE*)val, (DWORD)strlen(val) + 1);
+        }
+    } else {
+        RegDeleteValueA(k, "modlink");
+    }
+    RegCloseKey(k);
+}
+
 /* ------------------------------------------------------------- emitting */
 static char *jret(JBuf *b) { return b->buf ? b->buf : NULL; }
 
@@ -54,11 +138,12 @@ static char *emit_state_locked(void)
     JBuf b; int i;
     jb_init(&b);
     jb_raw(&b, "{");
-    jb_kv_bool(&b, "running", p3_running()); jb_raw(&b, ",");
+    jb_kv_bool(&b, "running", svc_running()); jb_raw(&b, ",");
     jb_raw(&b, "\"network\":{");
-    jb_kv_str(&b, "lan_ip",    g_cfg.lan_ip);  jb_raw(&b, ",");
-    jb_kv_str(&b, "wan_ip",    g_cfg.wan_ip);  jb_raw(&b, ",");
-    jb_kv_int(&b, "base_port", g_cfg.base_port);
+    jb_kv_str (&b, "lan_ip",    g_cfg.lan_ip);  jb_raw(&b, ",");
+    jb_kv_str (&b, "wan_ip",    g_cfg.wan_ip);  jb_raw(&b, ",");
+    jb_kv_int (&b, "base_port", g_cfg.base_port); jb_raw(&b, ",");
+    jb_kv_bool(&b, "autostart", g_cfg.autostart);
     jb_raw(&b, "},\"modems\":[");
     for (i = 0; i < g_cfg.count; i++) {
         if (i) jb_raw(&b, ",");
@@ -107,8 +192,8 @@ void pv_init(void)
 
 void pv_shutdown(void)
 {
-    reconn_shutdown();
-    p3_stop();
+    /* Closing the GUI must NOT stop the proxies — that is the whole point of the
+     * worker. The worker keeps running; nothing to do here. */
 }
 
 /* ------------------------------------------------------------- read */
@@ -124,7 +209,7 @@ char *pv_status(const char *req)
     JBuf b; (void)req;
     jb_init(&b);
     jb_raw(&b, "{");
-    jb_kv_bool(&b, "running", p3_running());
+    jb_kv_bool(&b, "running", svc_running());
     jb_raw(&b, "}");
     return jret(&b);
 }
@@ -168,15 +253,22 @@ char *pv_save_network(const char *req)
     const JVal *o; JVal *root = req_root(req, &o);
     char *s;
     lock();
+    BOOL autostart_changed = FALSE, autostart_val = FALSE;
     if (o && o->type == J_OBJ) {
         ml_strlcpy(g_cfg.lan_ip, json_str(o, "lan_ip", g_cfg.lan_ip), sizeof(g_cfg.lan_ip));
         ml_strlcpy(g_cfg.wan_ip, json_str(o, "wan_ip", g_cfg.wan_ip), sizeof(g_cfg.wan_ip));
         int bp = (int)json_num(o, "base_port", g_cfg.base_port);
         if (ml_port_valid(bp)) g_cfg.base_port = bp;
+        if (json_get(o, "autostart")) {
+            autostart_val = json_bool(o, "autostart", g_cfg.autostart);
+            autostart_changed = (autostart_val != g_cfg.autostart);
+            g_cfg.autostart = autostart_val;
+        }
         cfg_save(&g_cfg);
     }
     s = emit_state_locked();
     unlock();
+    if (autostart_changed) sync_autostart(autostart_val);
     json_free(root);
     return s;
 }
@@ -236,33 +328,52 @@ char *pv_delete_modem(const char *req)
 
 char *pv_stop(const char *req)
 {
-    JBuf b; (void)req;
-    reconn_shutdown();
-    p3_stop();
+    JBuf b; int i; (void)req;
+    worker_signal(EV_QUIT);                 /* worker stops 3proxy and exits */
+    for (i = 0; i < 30 && svc_running(); i++) Sleep(100);
     jb_init(&b);
     jb_raw(&b, "{"); jb_kv_bool(&b, "ok", 1); jb_raw(&b, ",");
-    jb_kv_bool(&b, "running", 0); jb_raw(&b, "}");
+    jb_kv_bool(&b, "running", svc_running()); jb_raw(&b, "}");
     return jret(&b);
 }
 
 /* ------------------------------------------------------------- slow ops */
+/* Apply now goes through the background worker: save config, then either signal
+ * a running worker to reload or spawn a fresh one (which applies on startup),
+ * and read back what it reports in status.json. */
 char *pv_apply(const char *req)
 {
-    char err[ML_PATH_LEN] = {0};
-    JBuf b; BOOL ok; int bad; (void)req;
+    char err[ML_PATH_LEN] = {0}, sp[ML_PATH_LEN];
+    JBuf b; BOOL ok = FALSE; int bad, i; (void)req;
 
     lock();
+    cfg_save(&g_cfg);                       /* the worker reads config.json */
     bad = cfg_validate(&g_cfg, err, sizeof(err));
-    if (bad != -1) { ok = FALSE; }
-    else {
-        ok = p3_apply(&g_cfg, err, sizeof(err));
-        if (ok) reconn_rebuild(&g_cfg);
-    }
     unlock();
+
+    if (bad == -1) {
+        /* drop the previous status so we only read the fresh worker's report */
+        snprintf(sp, sizeof(sp), "%s\\status.json", ml_dir_data());
+        DeleteFileA(sp);
+
+        if (worker_alive()) worker_signal(EV_RELOAD);
+        else                worker_spawn();
+
+        for (i = 0; i < 70; i++) {
+            if (svc_running()) { ok = TRUE; break; }
+            svc_read_err(err, sizeof(err));
+            if (err[0]) break;
+            Sleep(100);
+        }
+        if (!ok) {
+            svc_read_err(err, sizeof(err));
+            if (!err[0]) ml_strlcpy(err, "фоновая служба не ответила", sizeof(err));
+        }
+    }
 
     jb_init(&b);
     jb_raw(&b, "{"); jb_kv_bool(&b, "ok", ok); jb_raw(&b, ",");
-    jb_kv_bool(&b, "running", p3_running()); jb_raw(&b, ",");
+    jb_kv_bool(&b, "running", svc_running()); jb_raw(&b, ",");
     jb_kv_str(&b, "err", ok ? "" : err);
     jb_raw(&b, "}");
     return jret(&b);
@@ -292,7 +403,7 @@ char *pv_test(const char *req)
     unlock();
     json_free(root);
 
-    if (have && ml_port_valid(port) && p3_running()) {
+    if (have && ml_port_valid(port) && svc_running()) {
         /* Exit IP as seen from outside, through this modem's own port — proves
          * -e pinned the right LTE interface. */
         if (http_get_via_proxy("http://api.ipify.org", proxy, port, login, pass, 9000, &r)
@@ -328,7 +439,7 @@ char *pv_test(const char *req)
     jb_kv_bool(&b, "ok", ml_is_ipv4(exit_ip)); jb_raw(&b, ",");
     jb_kv_str(&b, "exit_ip", exit_ip); jb_raw(&b, ",");
     jb_kv_bool(&b, "huawei", huawei); jb_raw(&b, ",");
-    jb_kv_str(&b, "err", have ? (p3_running() ? "" : "3proxy не запущен") : "модем не найден");
+    jb_kv_str(&b, "err", have ? (svc_running() ? "" : "прокси не запущен — нажми «Применить»") : "модем не найден");
     jb_raw(&b, "}");
     return jret(&b);
 }

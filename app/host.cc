@@ -17,11 +17,13 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstring>
 
 #include "webview.h"
 
 extern "C" {
 #include "bridge.h"
+int worker_run(void);   /* src/worker.c — background engine, no window */
 }
 
 typedef char *(*bridge_fn)(const char *);
@@ -111,10 +113,17 @@ static bool already_running()
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nCmdShow)
 {
-    (void)hInst; (void)hPrev; (void)cmd; (void)nCmdShow;
+    (void)hInst; (void)hPrev; (void)nCmdShow;
 
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    /* Background engine: no window, no GUI. Owns 3proxy + reconnect + watchdog. */
+    if (cmd && strstr(cmd, "--worker")) {
+        int rc = worker_run();
+        WSACleanup();
+        return rc;
+    }
 
     if (already_running()) { WSACleanup(); return 0; }
 

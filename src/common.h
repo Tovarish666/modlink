@@ -145,4 +145,7 @@ int    reconn_log_read(int modem_id, int max_lines, char ***out);
 /* ---------------------------------------------------------------- ui */
 int    ui_run(HINSTANCE hInst, int nCmdShow);
 
+/* ---------------------------------------------------------------- worker */
+int    worker_run(void);        /* background engine: modlink.exe --worker */
+
 #endif /* MODLINK_COMMON_H */

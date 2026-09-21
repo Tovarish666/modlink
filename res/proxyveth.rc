@@ -2,6 +2,9 @@
 
 1 RT_MANIFEST "app.manifest"
 
+/* App icon (taskbar, window, Explorer). host.cc loads icon id 1. */
+1 ICON "modlink.ico"
+
 /* 3proxy.exe — dropped to %LOCALAPPDATA%\modlink\bin on first run.
  * tools/fetch-3proxy.ps1 places res\3proxy.exe here before the build. */
 101 RCDATA "3proxy.exe"

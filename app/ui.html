@@ -155,10 +155,6 @@ input::placeholder{color:var(--tx3)}
     <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><circle cx="7" cy="7.5" r=".6"/><circle cx="7" cy="16.5" r=".6"/></svg>
     Сервер
   </div>
-  <div class="nav" data-view="adapters">
-    <svg viewBox="0 0 24 24"><path d="M9 7V3M15 7V3M8 7h8v4a4 4 0 0 1-8 0zM12 15v6"/></svg>
-    Адаптеры
-  </div>
   <div class="foot">
     <span id="railStatus" class="st"><i></i><span id="railStatusText">остановлен</span></span><br>
     <span id="railMeta">модемов 0</span><br>
@@ -202,6 +198,11 @@ input::placeholder{color:var(--tx3)}
               <div class="hint">с него предлагаются порты новым модемам</div>
             </div>
           </div>
+          <label class="switch" style="margin-top:14px">
+            <input type="checkbox" id="netAutostart">
+            <span>Запускать в фоне при входе в Windows</span>
+          </label>
+          <div class="hint" style="margin-top:4px">после «Применить» прокси работают в фоне и после закрытия окна; галочка — ещё и автозапуск при входе</div>
         </div>
       </div>
 
@@ -233,19 +234,6 @@ input::placeholder{color:var(--tx3)}
         <h3>Пока нет модемов</h3>
         <p>Нажми «Модем», чтобы добавить первую строку. Порт, логин, пароль и адреса
         вида 192.168.N.x подставятся автоматически — потом правь под свои.</p>
-      </div>
-    </div>
-  </section>
-
-  <!-- ADAPTERS -->
-  <section class="view" data-view="adapters">
-    <div class="topbar"><h1>Адаптеры</h1><span class="sub">виртуальные интерфейсы</span></div>
-    <div class="scroll">
-      <div class="empty">
-        <div class="ico"><svg viewBox="0 0 24 24"><path d="M9 7V3M15 7V3M8 7h8v4a4 4 0 0 1-8 0zM12 15v6"/></svg></div>
-        <h3>Раздел в работе</h3>
-        <p>Здесь появятся виртуальные адаптеры — Ethernet N, состояние «Сеть N»,
-        маскировка под Remote NDIS. Создание, редактирование и удаление прямо из панели.</p>
       </div>
     </div>
   </section>
@@ -347,6 +335,7 @@ function render(){
   $("#netLan").value=ST.network.lan_ip||"";
   $("#netWan").value=ST.network.wan_ip||"";
   $("#netBase").value=ST.network.base_port||15000;
+  $("#netAutostart").checked=!!ST.network.autostart;
   $("#rows").innerHTML=ST.modems.map(rowHTML).join("");
   ST.modems.forEach(m=>{
     setVal(m.id,"login",m.login); setVal(m.id,"pass",m.pass);
@@ -368,6 +357,13 @@ function collect(id){
     interval_min:num("interval_min",0), enabled:chk("enabled")};
 }
 async function saveModem(id){ ST=await api("pv_update_modem",collect(id)); /* no re-render: DOM already current */ }
+async function saveNetwork(){
+  ST=await api("pv_save_network",{
+    lan_ip:$("#netLan").value.trim(), wan_ip:$("#netWan").value.trim(),
+    base_port:parseInt($("#netBase").value,10)||15000,
+    autostart:$("#netAutostart").checked});
+  summary();
+}
 
 /* ---- events ---- */
 function bindEvents(){
@@ -377,19 +373,23 @@ function bindEvents(){
     $$(".rail .nav").forEach(x=>x.classList.toggle("on",x===n));
     $$(".view").forEach(s=>s.classList.toggle("on",s.dataset.view===v));
   });
-  // network fields
-  $$("[data-net]").forEach(inp=>inp.addEventListener("change",async()=>{
-    ST=await api("pv_save_network",{lan_ip:$("#netLan").value.trim(),
-      wan_ip:$("#netWan").value.trim(), base_port:parseInt($("#netBase").value,10)||15000});
-    summary();
-  }));
+  // network fields + autostart
+  $$("[data-net]").forEach(inp=>inp.addEventListener("change",saveNetwork));
+  $("#netAutostart").addEventListener("change",saveNetwork);
   // delegated modem row edits
   $("#rows").addEventListener("change",e=>{
     const el=e.target.closest("[data-id][data-field]");
-    if(el) saveModem(parseInt(el.dataset.id,10));
-    if(el&&el.dataset.field==="enabled"){
+    if(!el) return;
+    const id=parseInt(el.dataset.id,10);
+    // № drives the modem IP and login: № 67 -> 192.168.67.100 / modem67
+    if(el.dataset.field==="n"){
+      const n=parseInt(el.value,10);
+      if(!isNaN(n)&&n>=1&&n<=254){ setVal(id,"lan_ip",`192.168.${n}.100`); setVal(id,"login",`modem${n}`); }
+    }
+    if(el.dataset.field==="enabled"){
       const row=el.closest(".trow"); if(row) row.classList.toggle("dis",!el.checked);
     }
+    saveModem(id);
   });
   // delegated actions
   $("#rows").addEventListener("click",e=>{
