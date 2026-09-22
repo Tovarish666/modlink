@@ -77,7 +77,14 @@ static BOOL svc_running(void)
     age = ((((ULONGLONG)now.dwHighDateTime) << 32) | now.dwLowDateTime)
         - ((((ULONGLONG)fad.ftLastWriteTime.dwHighDateTime) << 32) | fad.ftLastWriteTime.dwLowDateTime);
     if (age > 100000000ULL) return FALSE;
-    if (ml_read_file(path, &buf, &len) && buf) { r = strstr(buf, "\"running\":true") != NULL; free(buf); }
+    if (ml_read_file(path, &buf, &len) && buf) {
+        JVal *root = json_parse(buf);           /* parse, don't substring-match:
+                                                 * the file has "running": true
+                                                 * with a space, which the old
+                                                 * strstr missed. */
+        if (root) { r = json_bool(root, "running", 0); json_free(root); }
+        free(buf);
+    }
     return r;
 }
 
