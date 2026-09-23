@@ -35,7 +35,8 @@ typedef struct {
     char  lan_ip[ML_ADDR_LEN];      /* 3proxy -e : outbound bind = modem iface on host */
     char  modem_ip[ML_ADDR_LEN];    /* Huawei HiLink web UI host */
     int   proxy_port;               /* 3proxy `auto` service port */
-    int   reconn_port;              /* our own reconnect HTTP listener port */
+    int   reconn_port;              /* reconnect HTTP listener port  (GET /reconnect) */
+    int   reboot_port;              /* reboot   HTTP listener port  (GET /reboot)     */
     int   interval_min;             /* auto-reconnect period, 0 = off */
     BOOL  enabled;
 
@@ -57,6 +58,7 @@ typedef struct {
     BOOL  wan_auto;                 /* re-detect WAN on startup */
     BOOL  lan_auto;                 /* re-detect LAN on startup */
     int   base_port;                /* only SUGGESTS ports for newly added rows */
+    int   mode;                     /* 0 = per-modem port triples, 1 = one shared port + one control port */
     BOOL  autostart;                /* register in HKCU Run */
     BOOL  start_minimized;
 
@@ -100,6 +102,10 @@ Modem *cfg_find_by_id(Config *c, int id);
  * matter now that ports are hand-entered. */
 int    cfg_validate(const Config *c, char *err, size_t errcap);
 int    cfg_suggest_port(const Config *c, BOOL reconnect_port);
+/* Re-assign every modem's proxy/reboot/reconnect ports from base_port per mode:
+ * mode 0 = consecutive triples (P,P+1,P+2); mode 1 = shared proxy P and shared
+ * control P+1 for all modems. Called when the mode or base port changes. */
+void   cfg_assign_ports(Config *c);
 
 /* ---------------------------------------------------------------- 3proxy */
 BOOL   p3_extract_binary(void);               /* unpack embedded 3proxy.exe */

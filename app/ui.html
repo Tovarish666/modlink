@@ -56,6 +56,7 @@ body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:13px
 .btn:active{transform:scale(.98)}
 .btn.acc{background:var(--acc);border-color:transparent;color:var(--on);font-weight:500}
 .btn.acc:hover{filter:brightness(1.08);background:var(--acc)}
+.segbtn.on{background:var(--acc);border-color:transparent;color:var(--on);font-weight:500}
 .btn.ghost{border-color:transparent;color:var(--tx2);padding:6px 9px}
 .btn.ghost:hover{color:var(--tx);background:rgba(255,255,255,.05)}
 .btn:disabled{opacity:.5;cursor:default}
@@ -198,6 +199,14 @@ input::placeholder{color:var(--tx3)}
               <div class="hint">с него предлагаются порты новым модемам</div>
             </div>
           </div>
+          <div style="margin-top:16px">
+            <label style="font-size:12px;color:var(--tx2);margin-bottom:6px;display:block">Режим портов</label>
+            <div style="display:flex;gap:8px">
+              <button class="btn segbtn" data-mode="0">Разные порты (тройки)</button>
+              <button class="btn segbtn" data-mode="1">Один порт (по логину)</button>
+            </div>
+            <div class="hint" style="margin-top:5px">тройки: у каждого модема 15000 прокси / 15001 ребут / 15002 реконнект, дальше 15003… · один порт: все прокси на одном порту + один контрол-порт для ребута/реконнекта, модем определяется по логину:паролю</div>
+          </div>
           <label class="switch" style="margin-top:14px">
             <input type="checkbox" id="netAutostart">
             <span>Запускать в фоне при входе в Windows</span>
@@ -246,7 +255,7 @@ input::placeholder{color:var(--tx3)}
 "use strict";
 const $=(s,r=document)=>r.querySelector(s);
 const $$=(s,r=document)=>[...r.querySelectorAll(s)];
-let ST={running:false,network:{lan_ip:"",wan_ip:"",base_port:15000},modems:[]};
+let ST={running:false,network:{lan_ip:"",wan_ip:"",base_port:15000,mode:0,autostart:false},modems:[]};
 
 /* ---- bridge helpers (webview injects pv_* as globals returning promises) ---- */
 async function api(name,...args){
@@ -315,12 +324,13 @@ function rowHTML(m){
       <div class="grid4">
         <div><label>Порт реконнекта</label>
           <input data-id="${m.id}" data-field="reconn_port" value="${m.reconn_port}" inputmode="numeric"></div>
+        <div><label>Порт ребута</label>
+          <input data-id="${m.id}" data-field="reboot_port" value="${m.reboot_port}" inputmode="numeric"></div>
         <div><label>Авто-реконнект, мин (0 — выкл)</label>
           <input data-id="${m.id}" data-field="interval_min" value="${m.interval_min}" inputmode="numeric"></div>
         <div style="display:flex;align-items:flex-end">
           <label class="switch"><input type="checkbox" data-id="${m.id}" data-field="enabled" ${m.enabled?"checked":""}>включён</label>
         </div>
-        <div></div>
       </div>
       <div class="row2">
         <button class="btn" data-act="reboot" data-id="${m.id}">${svg(IC.reboot)}Ребут модема</button>
@@ -337,6 +347,7 @@ function render(){
   $("#netWan").value=ST.network.wan_ip||"";
   $("#netBase").value=ST.network.base_port||15000;
   $("#netAutostart").checked=!!ST.network.autostart;
+  $$(".segbtn").forEach(b=>b.classList.toggle("on",(+b.dataset.mode)===(ST.network.mode||0)));
   $("#rows").innerHTML=ST.modems.map(rowHTML).join("");
   ST.modems.forEach(m=>{
     setVal(m.id,"login",m.login); setVal(m.id,"pass",m.pass);
@@ -355,6 +366,7 @@ function collect(id){
   return {id, n:num("n",1), login:str("login"), pass:str("pass"),
     lan_ip:str("lan_ip"),
     proxy_port:num("proxy_port",0), reconn_port:num("reconn_port",0),
+    reboot_port:num("reboot_port",0),
     interval_min:num("interval_min",0), enabled:chk("enabled")};
 }
 async function saveModem(id){ ST=await api("pv_update_modem",collect(id)); /* no re-render: DOM already current */ }
@@ -377,6 +389,7 @@ function bindEvents(){
   // network fields + autostart
   $$("[data-net]").forEach(inp=>inp.addEventListener("change",saveNetwork));
   $("#netAutostart").addEventListener("change",saveNetwork);
+  $$(".segbtn").forEach(b=>b.onclick=async()=>{ ST=await api("pv_set_mode",+b.dataset.mode); render(); toast("Порты перезаполнены под режим","ok"); });
   // delegated modem row edits
   $("#rows").addEventListener("change",e=>{
     const el=e.target.closest("[data-id][data-field]");
@@ -462,8 +475,11 @@ async function doReboot(id){
 }
 function cliIP(){ return ST.network.wan_ip||ST.network.lan_ip||"IP"; }
 function proxyLine(m){ return `${cliIP()}:${m.proxy_port}:${m.login}:${m.pass}`; }
-function reconnLine(m){ return `http://${cliIP()}:${m.reconn_port}/reconnect`; }
-function rebootLine(m){ return `http://${cliIP()}:${m.reconn_port}/reboot`; }
+/* В режиме «один порт» контрол на общем порту различает модем по логину/паролю,
+ * поэтому кладём их в URL (login:pass@). В режиме «тройки» порт уникален — без auth. */
+function ctlAuth(m){ return ST.network.mode===1 ? `${encodeURIComponent(m.login)}:${encodeURIComponent(m.pass)}@` : ""; }
+function reconnLine(m){ return `http://${ctlAuth(m)}${cliIP()}:${m.reconn_port}/reconnect`; }
+function rebootLine(m){ return `http://${ctlAuth(m)}${cliIP()}:${m.reboot_port}/reboot`; }
 async function copyText(text){ try{ const r=await api("pv_clip",text); return !!(r&&r.ok); }catch(e){ return false; } }
 async function doCopy(id){
   const m=ST.modems.find(x=>x.id===id); if(!m) return;

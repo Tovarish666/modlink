@@ -158,6 +158,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nCmdShow)
     reg(w, "pv_clip",         pv_clip,         false);
     reg(w, "pv_save_network", pv_save_network, false);
     reg(w, "pv_add_modem",    pv_add_modem,    false);
+    reg(w, "pv_set_mode",     pv_set_mode,     false);
     reg(w, "pv_update_modem", pv_update_modem, false);
     reg(w, "pv_delete_modem", pv_delete_modem, false);
     reg(w, "pv_stop",         pv_stop,         false);

@@ -133,6 +133,7 @@ static void emit_modem(JBuf *b, const Modem *m)
     jb_kv_str (b, "modem_ip",     m->modem_ip);     jb_raw(b, ",");
     jb_kv_int (b, "proxy_port",   m->proxy_port);   jb_raw(b, ",");
     jb_kv_int (b, "reconn_port",  m->reconn_port);  jb_raw(b, ",");
+    jb_kv_int (b, "reboot_port",  m->reboot_port);  jb_raw(b, ",");
     jb_kv_int (b, "interval_min", m->interval_min); jb_raw(b, ",");
     jb_kv_bool(b, "enabled",      m->enabled);      jb_raw(b, ",");
     jb_kv_str (b, "exit_ip",      m->last_exit_ip);
@@ -150,6 +151,7 @@ static char *emit_state_locked(void)
     jb_kv_str (&b, "lan_ip",    g_cfg.lan_ip);  jb_raw(&b, ",");
     jb_kv_str (&b, "wan_ip",    g_cfg.wan_ip);  jb_raw(&b, ",");
     jb_kv_int (&b, "base_port", g_cfg.base_port); jb_raw(&b, ",");
+    jb_kv_int (&b, "mode",      g_cfg.mode);      jb_raw(&b, ",");
     jb_kv_bool(&b, "autostart", g_cfg.autostart);
     jb_raw(&b, "},\"modems\":[");
     for (i = 0; i < g_cfg.count; i++) {
@@ -291,6 +293,22 @@ char *pv_add_modem(const char *req)
     return s;
 }
 
+/* Switch mode (0 = port triples, 1 = one shared port) and re-fill every modem's
+ * ports to match. req[0] = the new mode as a number. */
+char *pv_set_mode(const char *req)
+{
+    const JVal *o; JVal *root = req_root(req, &o);
+    char *s;
+    lock();
+    if (o && o->type == J_NUM) g_cfg.mode = ((int)o->num) ? 1 : 0;
+    cfg_assign_ports(&g_cfg);
+    cfg_save(&g_cfg);
+    s = emit_state_locked();
+    unlock();
+    json_free(root);
+    return s;
+}
+
 char *pv_update_modem(const char *req)
 {
     const JVal *o; JVal *root = req_root(req, &o);
@@ -308,6 +326,7 @@ char *pv_update_modem(const char *req)
             derive_gateway(m->lan_ip, m->modem_ip, sizeof(m->modem_ip));
             m->proxy_port   = (int)json_num(o, "proxy_port",   m->proxy_port);
             m->reconn_port  = (int)json_num(o, "reconn_port",  m->reconn_port);
+            m->reboot_port  = (int)json_num(o, "reboot_port",  m->reboot_port);
             m->interval_min = (int)json_num(o, "interval_min", m->interval_min);
             m->enabled      =      json_bool(o, "enabled",     m->enabled);
             cfg_save(&g_cfg);

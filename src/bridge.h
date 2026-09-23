@@ -27,6 +27,7 @@ char *pv_clip(const char *req);        /* req[0] = text -> Windows clipboard    
 /* --- mutate (fast, run on the UI thread) ------------------------------ */
 char *pv_save_network(const char *req);/* req[0] = {lan_ip, base_port}  -> state */
 char *pv_add_modem(const char *req);   /* -> state (with the new row)            */
+char *pv_set_mode(const char *req);    /* req[0]=mode(0/1); refills ports -> state */
 char *pv_update_modem(const char *req);/* req[0] = full modem object    -> state */
 char *pv_delete_modem(const char *req);/* req[0] = id (number)          -> state */
 char *pv_stop(const char *req);        /* stop 3proxy                   -> {ok}  */

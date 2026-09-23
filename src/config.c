@@ -41,6 +41,27 @@ int cfg_suggest_port(const Config *c, BOOL reconnect_port)
     return p;
 }
 
+/* Re-assign all ports from base_port per mode (a deliberate action: the user
+ * changed the mode or asked to auto-fill, so renumbering is expected here). */
+void cfg_assign_ports(Config *c)
+{
+    int base = ml_port_valid(c->base_port) ? c->base_port : CFG_DEFAULT_BASE_PORT, i;
+    if (c->mode == 1) {
+        for (i = 0; i < c->count; i++) {
+            c->modems[i].proxy_port  = base;        /* all proxies on one port  */
+            c->modems[i].reboot_port = base + 1;    /* one control port for both */
+            c->modems[i].reconn_port = base + 1;
+        }
+    } else {
+        for (i = 0; i < c->count; i++) {
+            int p = base + i * 3;                    /* consecutive triples      */
+            c->modems[i].proxy_port  = p;
+            c->modems[i].reboot_port = p + 1;
+            c->modems[i].reconn_port = p + 2;
+        }
+    }
+}
+
 /* ------------------------------------------------------------- add / remove */
 int cfg_add_modem(Config *c)
 {
@@ -66,10 +87,19 @@ int cfg_add_modem(Config *c)
     snprintf(m->lan_ip,   sizeof(m->lan_ip),   "192.168.%d.100", m->n);
     snprintf(m->modem_ip, sizeof(m->modem_ip), "192.168.%d.1",   m->n);
 
-    m->proxy_port   = cfg_suggest_port(c, FALSE);
-    c->count++;                               /* count first so the reconnect  */
-    m->reconn_port  = cfg_suggest_port(c, FALSE);  /* port avoids the proxy one */
-    c->count--;
+    /* Ports follow the current mode. A new row does NOT renumber existing ones:
+     * mode 0 appends the next free triple, mode 1 reuses the shared pair. */
+    if (c->mode == 1) {
+        m->proxy_port  = c->base_port;
+        m->reboot_port = c->base_port + 1;
+        m->reconn_port = c->base_port + 1;
+    } else {
+        int k, hi = 0;
+        for (k = 0; k < c->count; k++) if (c->modems[k].proxy_port > hi) hi = c->modems[k].proxy_port;
+        m->proxy_port  = hi ? hi + 3 : c->base_port;
+        m->reboot_port = m->proxy_port + 1;
+        m->reconn_port = m->proxy_port + 2;
+    }
 
     m->interval_min = 0;
     m->enabled      = TRUE;
@@ -136,8 +166,14 @@ int cfg_validate(const Config *c, char *err, size_t errcap)
             snprintf(err, errcap, "Строка %d (%s): некорректный порт реконнекта", i + 1, m->login);
             return i;
         }
-        if (m->proxy_port == m->reconn_port) {
-            snprintf(err, errcap, "Строка %d (%s): порт прокси и порт реконнекта совпадают (%d)",
+        if (m->reboot_port != 0 && !ml_port_valid(m->reboot_port)) {
+            snprintf(err, errcap, "Строка %d (%s): некорректный порт ребута", i + 1, m->login);
+            return i;
+        }
+        /* proxy is 3proxy, reboot/reconnect are HTTP — they cannot share a port.
+         * reboot_port == reconn_port IS fine (one control listener serves both). */
+        if (m->proxy_port == m->reconn_port || m->proxy_port == m->reboot_port) {
+            snprintf(err, errcap, "Строка %d (%s): порт прокси совпадает с портом ребута/реконнекта (%d)",
                      i + 1, m->login, m->proxy_port);
             return i;
         }
@@ -156,15 +192,11 @@ int cfg_validate(const Config *c, char *err, size_t errcap)
         for (j = 0; j < c->count; j++) {
             const Modem *o = &c->modems[j];
             if (j == i || !o->enabled) continue;
-            if (o->reconn_port == m->proxy_port) {
-                snprintf(err, errcap, "Порт %d: у строки %d это порт прокси, а у строки %d — порт реконнекта",
+            /* a proxy port must not double as ANY modem's control (HTTP) port.
+             * Control ports MAY repeat across modems (mode 1 shares one). */
+            if (o->reconn_port == m->proxy_port || o->reboot_port == m->proxy_port) {
+                snprintf(err, errcap, "Порт %d занят и как прокси (строка %d), и как контрол (строка %d)",
                          m->proxy_port, i + 1, j + 1);
-                return i;
-            }
-            if (m->reconn_port &&
-                (o->proxy_port == m->reconn_port || o->reconn_port == m->reconn_port)) {
-                snprintf(err, errcap, "Порт %d занят дважды: строки %d и %d",
-                         m->reconn_port, i + 1, j + 1);
                 return i;
             }
             if (j > i && !strcmp(o->login, m->login)) {
@@ -189,6 +221,9 @@ static void modem_from_json(Modem *m, const JVal *o, int fallback_id)
     ml_strlcpy(m->modem_ip,  json_str(o, "modem_ip",  ""),        sizeof(m->modem_ip));
     m->proxy_port   = (int)json_num(o, "proxy_port",   0);
     m->reconn_port  = (int)json_num(o, "reconn_port",  0);
+    /* old configs had no reboot_port — they served /reboot on the reconnect
+     * port, so default to it for a seamless migration. */
+    m->reboot_port  = (int)json_num(o, "reboot_port",  m->reconn_port);
     m->interval_min = (int)json_num(o, "interval_min", 0);
     m->enabled      =      json_bool(o, "enabled",     1);
     if (!m->login[0]) snprintf(m->login, sizeof(m->login), "modem%d", m->n);
@@ -232,16 +267,15 @@ static BOOL import_legacy(Config *c)
         tok = strtok_s(NULL, " \t", &ts);
         if (tok) m->interval_min = atoi(tok);
 
-        /* Old port formula: base + sorted_index*2 (proxy) and +1 (reconnect).
-         * Reproduced only so an upgrade keeps working credentials — from now on
-         * these are stored values that never move on their own. */
-        m->proxy_port  = c->base_port + imported * 2;
-        m->reconn_port = c->base_port + imported * 2 + 1;
         imported++;
     }
     free(buf);
 
     if (imported) {
+        /* The old panel only carried a login/pass/interval per modem; ports were
+         * derived. Lay them out cleanly for the current mode (a fresh triple per
+         * modem, or the shared pair) so every reboot_port is set and consistent. */
+        cfg_assign_ports(c);
         ml_log("imported %d modems from legacy modems.conf", imported);
         MoveFileExA(path, "modems.conf.imported", MOVEFILE_REPLACE_EXISTING);
     }
@@ -276,6 +310,7 @@ BOOL cfg_load(Config *c)
     c->wan_auto        = json_bool(root, "wan_auto", 1);
     c->lan_auto        = json_bool(root, "lan_auto", 1);
     c->base_port       = (int)json_num(root, "base_port", CFG_DEFAULT_BASE_PORT);
+    c->mode            = (int)json_num(root, "mode", 0);
     c->autostart       = json_bool(root, "autostart", 0);
     c->start_minimized = json_bool(root, "start_minimized", 0);
     if (!ml_port_valid(c->base_port)) c->base_port = CFG_DEFAULT_BASE_PORT;
@@ -308,6 +343,7 @@ BOOL cfg_save(const Config *c)
     jb_kv_bool(&b, "wan_auto", c->wan_auto);      jb_comma(&b); jb_raw(&b, "  ");
     jb_kv_bool(&b, "lan_auto", c->lan_auto);      jb_comma(&b); jb_raw(&b, "  ");
     jb_kv_int (&b, "base_port", c->base_port);    jb_comma(&b); jb_raw(&b, "  ");
+    jb_kv_int (&b, "mode", c->mode);              jb_comma(&b); jb_raw(&b, "  ");
     jb_kv_bool(&b, "autostart", c->autostart);    jb_comma(&b); jb_raw(&b, "  ");
     jb_kv_bool(&b, "start_minimized", c->start_minimized); jb_comma(&b); jb_raw(&b, "  ");
     jb_str(&b, "modems"); jb_raw(&b, ": [");
@@ -324,6 +360,7 @@ BOOL cfg_save(const Config *c)
         jb_raw(&b, "\n     ");
         jb_kv_int (&b, "proxy_port",   m->proxy_port);   jb_raw(&b, ", ");
         jb_kv_int (&b, "reconn_port",  m->reconn_port);  jb_raw(&b, ", ");
+        jb_kv_int (&b, "reboot_port",  m->reboot_port);  jb_raw(&b, ", ");
         jb_kv_int (&b, "interval_min", m->interval_min); jb_raw(&b, ", ");
         jb_kv_bool(&b, "enabled",      m->enabled);
         jb_raw(&b, "}");
