@@ -176,6 +176,10 @@ BOOL p3_write_config(const Config *c, char *err, size_t errcap)
             snprintf(line, sizeof(line), "auto -p%d", port);
             jb_raw(&b, line);
             if (listen_ip[0]) { snprintf(line, sizeof(line), " -i%s", listen_ip); jb_raw(&b, line); }
+            /* -Ni<wan> = the address 3proxy advertises to a SOCKS5 client for
+             * UDP ASSOCIATE. Without it the client is told the host's private
+             * LAN IP, unreachable from outside NAT; report the external IP. */
+            if (c->wan_ip[0]) { snprintf(line, sizeof(line), " -Ni%s", c->wan_ip); jb_raw(&b, line); }
             jb_raw(&b, " -olSO_EXCLUSIVEADDRUSE\n\n");
             services++;
         }

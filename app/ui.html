@@ -213,9 +213,10 @@ input::placeholder{color:var(--tx3)}
           <button id="btnCopyAll" class="btn">
             <svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>Копировать</button>
           <div id="copyMenu" class="menu" hidden>
-            <button data-copy="both">Прокси + реконнекты</button>
             <button data-copy="proxy">Только прокси</button>
-            <button data-copy="reconn">Только реконнекты</button>
+            <button data-copy="reboot">Только ссылки ребута</button>
+            <button data-copy="reconn">Только ссылки реконнекта</button>
+            <button data-copy="all">Прокси + ребут + реконнект</button>
           </div>
         </div>
         <button id="btnAdd" class="btn acc">
@@ -462,6 +463,7 @@ async function doReboot(id){
 function cliIP(){ return ST.network.wan_ip||ST.network.lan_ip||"IP"; }
 function proxyLine(m){ return `${cliIP()}:${m.proxy_port}:${m.login}:${m.pass}`; }
 function reconnLine(m){ return `http://${cliIP()}:${m.reconn_port}/reconnect`; }
+function rebootLine(m){ return `http://${cliIP()}:${m.reconn_port}/reboot`; }
 async function copyText(text){ try{ const r=await api("pv_clip",text); return !!(r&&r.ok); }catch(e){ return false; } }
 async function doCopy(id){
   const m=ST.modems.find(x=>x.id===id); if(!m) return;
@@ -472,11 +474,15 @@ async function doCopy(id){
 async function doCopyAll(mode){
   const ms=ST.modems;
   if(!ms.length){ toast("Список модемов пуст"); return; }
-  const prox=ms.map(proxyLine), rec=ms.map(reconnLine);
+  const prox=ms.map(proxyLine), reb=ms.map(rebootLine), rec=ms.map(reconnLine);
   let text,cnt;
   if(mode==="proxy"){ text=prox.join("\n"); cnt=prox.length; }
+  else if(mode==="reboot"){ text=reb.join("\n"); cnt=reb.length; }
   else if(mode==="reconn"){ text=rec.join("\n"); cnt=rec.length; }
-  else { text=prox.join("\n")+"\n\n"+rec.join("\n"); cnt=prox.length+rec.length; }
+  else { // all: за каждым модемом три строки подряд
+    text=ms.map(m=>proxyLine(m)+"\n"+rebootLine(m)+"\n"+reconnLine(m)).join("\n\n");
+    cnt=ms.length*3;
+  }
   const ok=await copyText(text);
   toast(ok?("Скопировано строк: "+cnt):"Не удалось скопировать",ok?"ok":"err");
 }

@@ -165,6 +165,20 @@ static DWORD WINAPI listener_thread(LPVOID arg)
                      ok ? "200 OK" : "500 Internal Server Error",
                      (int)strlen(body), body);
             send_all(c, resp, (int)strlen(resp));
+        } else if (!strncmp(req, "GET /reboot", 11)) {
+            char msg[256] = {0}, body[512], resp[1024];
+            BOOL ok = hilink_reboot(L->modem_ip, msg, sizeof(msg));
+            reconn_log_append(L->modem_id, ok ? "reboot (url) отправлен" : "reboot (url) ошибка");
+            snprintf(body, sizeof(body), "{\"ok\":%s,\"msg\":\"%s\"}",
+                     ok ? "true" : "false", msg);
+            snprintf(resp, sizeof(resp),
+                     "HTTP/1.1 %s\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Content-Length: %d\r\n"
+                     "Connection: close\r\n\r\n%s",
+                     ok ? "200 OK" : "500 Internal Server Error",
+                     (int)strlen(body), body);
+            send_all(c, resp, (int)strlen(resp));
         } else {
             static const char R404[] =
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
