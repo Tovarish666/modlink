@@ -38,18 +38,18 @@ static void write_status(BOOL running, const char *err)
     jb_free(&b);
 }
 
-/* Load config, validate, (re)start 3proxy + reconnect. Returns TRUE if the
- * proxy is meant to be running afterwards; fills err on failure. */
-static BOOL apply_now(char *err, size_t errcap)
+/* Load config into *cfg, validate, (re)start 3proxy + reconnect. Returns TRUE if
+ * the proxy is meant to be running afterwards; fills err on failure. *cfg is
+ * always populated (the periodic checks read it even when validation fails). */
+static BOOL apply_now(Config *cfg, char *err, size_t errcap)
 {
-    Config cfg;
     int bad;
     if (err && errcap) err[0] = 0;
-    if (!cfg_load(&cfg)) { cfg_defaults(&cfg); }
-    bad = cfg_validate(&cfg, err, errcap);
+    if (!cfg_load(cfg)) { cfg_defaults(cfg); }
+    bad = cfg_validate(cfg, err, errcap);
     if (bad != -1) return FALSE;
-    if (!p3_apply(&cfg, err, errcap)) return FALSE;
-    reconn_rebuild(&cfg);
+    if (!p3_apply(cfg, err, errcap)) return FALSE;
+    reconn_rebuild(cfg);
     return TRUE;
 }
 
@@ -58,6 +58,7 @@ int worker_run(void)
     HANDLE mtx, ev_reload, ev_stop, ev_quit, waits[3];
     BOOL run;
     char err[ML_PATH_LEN];
+    Config cfg;                 /* last loaded config; the checks read it */
 
     /* single worker only */
     mtx = CreateMutexA(NULL, TRUE, MTX_WORK);
@@ -71,14 +72,14 @@ int worker_run(void)
     ev_stop   = CreateEventA(NULL, FALSE, FALSE, EV_STOP);
     ev_quit   = CreateEventA(NULL, FALSE, FALSE, EV_QUIT);
 
-    run = apply_now(err, sizeof(err));
+    run = apply_now(&cfg, err, sizeof(err));
     write_status(run && p3_running(), run ? "" : err);
 
     waits[0] = ev_reload; waits[1] = ev_stop; waits[2] = ev_quit;
     for (;;) {
         DWORD w = WaitForMultipleObjects(3, waits, FALSE, 3000);
         if (w == WAIT_OBJECT_0) {                 /* reload */
-            run = apply_now(err, sizeof(err));
+            run = apply_now(&cfg, err, sizeof(err));
             if (!run) p3_stop();
         } else if (w == WAIT_OBJECT_0 + 1) {      /* stop */
             p3_stop();
@@ -90,9 +91,11 @@ int worker_run(void)
         } else {                                  /* timeout — watchdog */
             if (run && !p3_running()) {
                 ml_log("watchdog: 3proxy died, restarting");
-                run = apply_now(err, sizeof(err));
+                run = apply_now(&cfg, err, sizeof(err));
             }
         }
+        /* Periodic WAN / speed probes; a no-op until one comes due. */
+        checks_tick(&cfg, run && p3_running());
         write_status(run && p3_running(), run ? "" : err);
     }
 

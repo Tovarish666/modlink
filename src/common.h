@@ -151,6 +151,13 @@ int    reconn_log_read(int modem_id, int max_lines, char ***out);
 /* ---------------------------------------------------------------- ui */
 int    ui_run(HINSTANCE hInst, int nCmdShow);
 
+/* ---------------------------------------------------------------- checks */
+/* Periodic auto-checks, run by the worker and stored in checks.json. */
+void   checks_tick(const Config *c, int svc_up);   /* call each worker loop tick */
+/* One yaspeed run bound to `lan_ip` (empty = default route). Mbit/s + ms out. */
+BOOL   checks_speedtest(const char *lan_ip, double *down, double *up, double *ping,
+                        char *err, size_t errcap);
+
 /* ---------------------------------------------------------------- worker */
 int    worker_run(void);        /* background engine: modlink.exe --worker */
 

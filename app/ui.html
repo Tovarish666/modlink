@@ -112,6 +112,10 @@ input::placeholder{color:var(--tx3)}
 .testcell{font-family:var(--mono);font-size:11px;color:var(--tx3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .testcell.ok{color:var(--ok)}
 .testcell.fail{color:var(--danger)}
+.speedline{font-family:var(--mono);font-size:11px;color:var(--tx3);margin-top:8px}
+.speedline.ok{color:var(--ok)}
+.speedline.fail{color:var(--warn)}
+.speedline.busy{color:var(--tx2)}
 
 /* advanced expand */
 .adv{grid-column:1/-1;display:none;padding:10px 6px 6px;border-top:1px dashed var(--line)}
@@ -334,7 +338,9 @@ function rowHTML(m){
       </div>
       <div class="row2">
         <button class="btn" data-act="reboot" data-id="${m.id}">${svg(IC.reboot)}Ребут модема</button>
+        <button class="btn" data-act="speed" data-id="${m.id}">Спидтест</button>
       </div>
+      <div class="speedline" data-speed="${m.id}">—</div>
     </div>
   </span></div>`;
 }
@@ -355,6 +361,7 @@ function render(){
     if(m.exit_ip){ const c=$(`[data-test="${m.id}"]`); if(c){c.textContent=m.exit_ip;c.className="testcell ok";} }
   });
   runningUI(); summary();
+  if(typeof refreshChecks==="function") refreshChecks();   /* repaint WAN/speed */
 }
 
 /* ---- collect one modem row into an object ---- */
@@ -416,6 +423,7 @@ function bindEvents(){
     else if(act==="test") doTest(id,a);
     else if(act==="reconn") doReconn(id,a);
     else if(act==="reboot") doReboot(id);
+    else if(act==="speed") doSpeed(id,a);
     else if(act==="copy") doCopy(id);
   });
   $("#btnAdd").onclick=addModem;
@@ -473,6 +481,36 @@ async function doReboot(id){
   try{ const r=await api("pv_reboot",id); toast((r.ok?"Ребут отправлен: ":"Ошибка: ")+(r.msg||""),r.ok?"ok":"err"); }
   catch(e){ toast(String(e.message||e),"err"); }
 }
+async function doSpeed(id,a){
+  const line=$(`[data-speed="${id}"]`);
+  if(line){ line.textContent="тест… (10–30 c)"; line.className="speedline busy"; }
+  a.disabled=true;
+  try{
+    const r=await api("pv_speedtest",id);
+    if(r.ok){ if(line){ line.textContent=fmtSpeed(r); line.className="speedline ok"; } }
+    else { if(line){ line.textContent=r.err||"нет результата"; line.className="speedline fail"; } }
+  }catch(e){ if(line){ line.textContent="ошибка"; line.className="speedline fail"; } }
+  a.disabled=false;
+}
+/* ---- periodic checks (WAN hourly + speed at 12:00), read from the worker ---- */
+function fmtSpeed(r,ts){
+  const d=(+r.down||0).toFixed(1), u=(+r.up||0).toFixed(1), p=Math.round(+r.ping||0);
+  return `↓ ${d} · ↑ ${u} Мбит/с · ${p} мс`+(ts?" · "+ts:"");
+}
+function applyChecks(list){
+  (list||[]).forEach(r=>{
+    if(r.wan_ip){ const c=$(`[data-test="${r.id}"]`);
+      if(c && c.textContent!=="…"){ c.textContent=r.wan_ip; c.className="testcell ok"; } }
+    const line=$(`[data-speed="${r.id}"]`);
+    if(line && !line.classList.contains("busy")){
+      if(r.speed_err){ line.textContent=r.speed_err; line.className="speedline fail"; }
+      else if(r.speed_ts){ line.textContent=fmtSpeed(r, r.speed_ts.slice(11)); line.className="speedline ok"; }
+    }
+  });
+}
+async function refreshChecks(){
+  try{ const c=await api("pv_checks"); applyChecks(c&&c.modems); }catch(e){}
+}
 function cliIP(){ return ST.network.wan_ip||ST.network.lan_ip||"IP"; }
 function proxyLine(m){ return `${cliIP()}:${m.proxy_port}:${m.login}:${m.pass}`; }
 /* В режиме «один порт» контрол на общем порту различает модем по логину/паролю,
@@ -511,6 +549,8 @@ async function boot(tries){
   }
   try{ ST=await api("pv_get_state"); }catch(e){ ST.modems=[]; }
   bindEvents(); render();
+  refreshChecks();                       /* WAN/speed from the worker, right away */
+  setInterval(refreshChecks, 45000);     /* and keep it fresh */
 }
 document.addEventListener("DOMContentLoaded",()=>boot(0));
 </script>

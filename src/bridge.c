@@ -520,3 +520,47 @@ char *pv_reboot(const char *req)
     jb_raw(&b, "}");
     return jret(&b);
 }
+
+/* The worker's periodic results (checks.json), handed to the UI verbatim — it
+ * is already {modems:[{id,wan_ip,wan_ts,down,up,ping,speed_ts,speed_err}]}. */
+char *pv_checks(const char *req)
+{
+    char path[ML_PATH_LEN]; char *buf = NULL; size_t len = 0;
+    (void)req;
+    snprintf(path, sizeof(path), "%s\\checks.json", ml_dir_data());
+    if (ml_read_file(path, &buf, &len) && buf && len) return buf;
+    free(buf);
+    { char *s = (char *)malloc(16); if (s) memcpy(s, "{\"modems\":[]}", 14); return s; }
+}
+
+/* Manual speed test for one modem (bound to its LAN source IP), so the user can
+ * verify a link now instead of waiting for the daily 12:00 sweep. Slow — the
+ * host runs it on a worker thread. */
+char *pv_speedtest(const char *req)
+{
+    const JVal *o; JVal *root = req_root(req, &o);
+    int id; char lan[ML_ADDR_LEN] = {0}; BOOL have = FALSE, ok = FALSE;
+    double down = 0, up = 0, ping = 0; char err[96] = {0};
+    JBuf b;
+
+    id = (o && o->type == J_NUM) ? (int)o->num : 0;
+    lock();
+    { Modem *m = cfg_find_by_id(&g_cfg, id);
+      if (m) { have = TRUE; ml_strlcpy(lan, m->lan_ip, sizeof(lan)); } }
+    unlock();
+    json_free(root);
+
+    if (have) ok = checks_speedtest(lan, &down, &up, &ping, err, sizeof(err));
+    else ml_strlcpy(err, "модем не найден", sizeof(err));
+
+    jb_init(&b);
+    jb_raw(&b, "{");
+    jb_kv_int(&b, "id", id); jb_raw(&b, ",");
+    jb_kv_bool(&b, "ok", ok); jb_raw(&b, ",");
+    { char n[64];
+      snprintf(n, sizeof(n), "\"down\":%.2f,\"up\":%.2f,\"ping\":%.2f,", down, up, ping);
+      jb_raw(&b, n); }
+    jb_kv_str(&b, "err", err);
+    jb_raw(&b, "}");
+    return jret(&b);
+}

@@ -68,7 +68,7 @@ cl.exe /nologo /W3 /O2 /MT /EHsc /utf-8 /DUNICODE /D_UNICODE ^
    /Isrc /Ithird_party\webview /I"%WEBVIEW2_INCLUDE%" /Fobuild\ /Fdbuild\ ^
    app\host.cc ^
    src\util.c src\json.c src\config.c src\proxy3.c src\net.c ^
-   src\hilink.c src\reconn.c src\bridge.c src\worker.c ^
+   src\hilink.c src\reconn.c src\bridge.c src\worker.c src\checks.c ^
    build\proxyveth.res ^
    /link /SUBSYSTEM:WINDOWS /OUT:build\modlink.exe ^
    user32.lib gdi32.lib ole32.lib oleaut32.lib shlwapi.lib version.lib ^

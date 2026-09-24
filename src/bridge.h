@@ -22,6 +22,7 @@ void  pv_shutdown(void);
 /* --- read (req ignored, kept for a uniform binding signature) --------- */
 char *pv_get_state(const char *req);   /* {network:{...}, modems:[...], running} */
 char *pv_status(const char *req);      /* {running:bool} — cheap poll            */
+char *pv_checks(const char *req);      /* checks.json (periodic WAN + speed)      */
 char *pv_clip(const char *req);        /* req[0] = text -> Windows clipboard      */
 
 /* --- mutate (fast, run on the UI thread) ------------------------------ */
@@ -37,6 +38,7 @@ char *pv_apply(const char *req);       /* validate, write cfg, (re)start 3proxy 
 char *pv_test(const char *req);        /* req[0] = id -> {ok, exit_ip, huawei}   */
 char *pv_reconnect(const char *req);   /* req[0] = id -> {ok, msg, secs}         */
 char *pv_reboot(const char *req);      /* req[0] = id -> {ok, msg}               */
+char *pv_speedtest(const char *req);   /* req[0] = id -> {ok, down, up, ping}    */
 
 #ifdef __cplusplus
 }

@@ -155,6 +155,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nCmdShow)
 
     reg(w, "pv_get_state",    pv_get_state,    false);
     reg(w, "pv_status",       pv_status,       false);
+    reg(w, "pv_checks",       pv_checks,       false);
     reg(w, "pv_clip",         pv_clip,         false);
     reg(w, "pv_save_network", pv_save_network, false);
     reg(w, "pv_add_modem",    pv_add_modem,    false);
@@ -166,6 +167,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nCmdShow)
     reg(w, "pv_test",         pv_test,         true);
     reg(w, "pv_reconnect",    pv_reconnect,    true);
     reg(w, "pv_reboot",       pv_reboot,       true);
+    reg(w, "pv_speedtest",    pv_speedtest,    true);
 
     char *html = load_ui_html();
     if (html) { webview_set_html(w, html); free(html); }
