@@ -154,9 +154,16 @@ int    ui_run(HINSTANCE hInst, int nCmdShow);
 /* ---------------------------------------------------------------- checks */
 /* Periodic auto-checks, run by the worker and stored in checks.json. */
 void   checks_tick(const Config *c, int svc_up);   /* call each worker loop tick */
-/* One yaspeed run bound to `lan_ip` (empty = default route). Mbit/s + ms out. */
-BOOL   checks_speedtest(const char *lan_ip, double *down, double *up, double *ping,
-                        char *err, size_t errcap);
+
+/* ---------------------------------------------------------------- speedtest */
+/* Native port of yaspeed (Yandex Internetometer), routed through a modem's
+ * proxy. Fills down/up (Mbit/s), ping (ms) and server host. Needs 3proxy up. */
+BOOL   speedtest_run(const char *proxy_host, int proxy_port,
+                     const char *login, const char *pass,
+                     int duration_s, int threads,
+                     double *down, double *up, double *ping,
+                     char *server, size_t servercap,
+                     char *err, size_t errcap);
 
 /* ---------------------------------------------------------------- worker */
 int    worker_run(void);        /* background engine: modlink.exe --worker */

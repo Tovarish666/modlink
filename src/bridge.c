@@ -533,25 +533,31 @@ char *pv_checks(const char *req)
     { char *s = (char *)malloc(16); if (s) memcpy(s, "{\"modems\":[]}", 14); return s; }
 }
 
-/* Manual speed test for one modem (bound to its LAN source IP), so the user can
- * verify a link now instead of waiting for the daily 12:00 sweep. Slow — the
- * host runs it on a worker thread. */
+/* Manual speed test for one modem — the native yaspeed port, run through the
+ * modem's own proxy, so the user can verify a link now instead of waiting for
+ * the daily 12:00 sweep. Slow — the host runs it on a worker thread. */
 char *pv_speedtest(const char *req)
 {
     const JVal *o; JVal *root = req_root(req, &o);
-    int id; char lan[ML_ADDR_LEN] = {0}; BOOL have = FALSE, ok = FALSE;
+    int id, port = 0; BOOL have = FALSE, ok = FALSE;
+    char proxy[ML_ADDR_LEN] = {0}, login[ML_LOGIN_LEN] = {0}, pass[ML_PASS_LEN] = {0};
     double down = 0, up = 0, ping = 0; char err[96] = {0};
     JBuf b;
 
     id = (o && o->type == J_NUM) ? (int)o->num : 0;
     lock();
     { Modem *m = cfg_find_by_id(&g_cfg, id);
-      if (m) { have = TRUE; ml_strlcpy(lan, m->lan_ip, sizeof(lan)); } }
+      if (m) { have = TRUE; port = m->proxy_port;
+               ml_strlcpy(login, m->login, sizeof(login));
+               ml_strlcpy(pass,  m->pass,  sizeof(pass));
+               ml_strlcpy(proxy, g_cfg.lan_ip[0] ? g_cfg.lan_ip : "127.0.0.1", sizeof(proxy)); } }
     unlock();
     json_free(root);
 
-    if (have) ok = checks_speedtest(lan, &down, &up, &ping, err, sizeof(err));
-    else ml_strlcpy(err, "модем не найден", sizeof(err));
+    if (!have) ml_strlcpy(err, "модем не найден", sizeof(err));
+    else if (!svc_running()) ml_strlcpy(err, "прокси не запущен — нажми «Применить»", sizeof(err));
+    else ok = speedtest_run(proxy, port, login, pass, 8, 6,
+                            &down, &up, &ping, NULL, 0, err, sizeof(err));
 
     jb_init(&b);
     jb_raw(&b, "{");

@@ -7,13 +7,9 @@
  *   - WAN IP, hourly: fetch the external IP as seen THROUGH each modem's own
  *     proxy port (same route a client would take), so a silent SIM/IP change is
  *     visible. Needs 3proxy up.
- *   - speed test, daily at 12:00 local: run the user's yaspeed CLI bound to each
- *     modem's LAN source IP (`--source-ip`, which on Windows selects the modem's
- *     interface — see the source-routing note) and record down/up/ping.
- *
- * yaspeed.exe is NOT bundled: it is the user's own tool. We look for it next to
- * modlink.exe and in the data dir; if it is missing the speed sweep just records
- * a short note and tries again the next day.
+ *   - speed test, daily at 12:00 local: the native speedtest_run() (a C port of
+ *     the user's yaspeed, Yandex Internetometer backend) through each modem's
+ *     proxy, recording down/up/ping. No external tool. Needs 3proxy up.
  *
  * checks.json shape (one row per modem id):
  *   { "modems": [ { "id":1, "wan_ip":"1.2.3.4", "wan_ts":"2026-09-24 09:00",
@@ -137,110 +133,6 @@ static void save_rows(void)
     jb_free(&b);
 }
 
-/* ------------------------------------------------------------- yaspeed */
-/* Resolve yaspeed.exe: next to modlink.exe first, then the data dir. */
-static BOOL yaspeed_path(char *out, size_t cap)
-{
-    char exe[ML_PATH_LEN]; DWORD n; char *slash;
-    n = GetModuleFileNameA(NULL, exe, sizeof(exe));
-    if (n > 0 && n < sizeof(exe)) {
-        slash = strrchr(exe, '\\');
-        if (slash) {
-            *slash = 0;
-            snprintf(out, cap, "%s\\yaspeed.exe", exe);
-            if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return TRUE;
-        }
-    }
-    snprintf(out, cap, "%s\\yaspeed.exe", ml_dir_data());
-    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return TRUE;
-    return FALSE;
-}
-
-BOOL checks_speedtest(const char *lan_ip, double *down, double *up, double *ping,
-                      char *err, size_t errcap)
-{
-    char exe[ML_PATH_LEN], cmd[ML_PATH_LEN * 2], outpath[ML_PATH_LEN];
-    STARTUPINFOA si; PROCESS_INFORMATION pi; SECURITY_ATTRIBUTES sa;
-    HANDLE hout; DWORD wr;
-    char *buf = NULL; size_t len = 0; char *brace; JVal *root;
-    BOOL ok = FALSE;
-
-    if (err && errcap) err[0] = 0;
-    if (down) *down = 0; if (up) *up = 0; if (ping) *ping = 0;
-
-    if (!yaspeed_path(exe, sizeof(exe))) {
-        if (err) ml_strlcpy(err, "yaspeed.exe не найден (положи рядом с modlink.exe)", errcap);
-        return FALSE;
-    }
-
-    /* per-call output file so a manual run and the daily sweep can't clash */
-    snprintf(outpath, sizeof(outpath), "%s\\yaspeed_%llu.json",
-             ml_dir_data(), (unsigned long long)GetTickCount64());
-
-    memset(&sa, 0, sizeof(sa));
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    hout = CreateFileA(outpath, GENERIC_WRITE, FILE_SHARE_READ, &sa,
-                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hout == INVALID_HANDLE_VALUE) {
-        if (err) ml_strlcpy(err, "не удалось создать временный файл", errcap);
-        return FALSE;
-    }
-
-    /* --json prints one clean JSON object to stdout; progress goes to stderr,
-     * which we leave attached to nothing. CREATE_NO_WINDOW: no console flashes. */
-    if (lan_ip && lan_ip[0])
-        snprintf(cmd, sizeof(cmd),
-                 "\"%s\" --json --duration 8 --threads 6 --source-ip %s", exe, lan_ip);
-    else
-        snprintf(cmd, sizeof(cmd), "\"%s\" --json --duration 8 --threads 6", exe);
-
-    memset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = hout;
-    si.hStdError  = hout;
-    si.hStdInput  = NULL;
-    memset(&pi, 0, sizeof(pi));
-
-    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-                        NULL, NULL, &si, &pi)) {
-        CloseHandle(hout);
-        DeleteFileA(outpath);
-        if (err) snprintf(err, errcap, "не удалось запустить yaspeed (код %lu)", GetLastError());
-        return FALSE;
-    }
-
-    wr = WaitForSingleObject(pi.hProcess, 120000);   /* 2 min hard cap */
-    if (wr != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 1);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    CloseHandle(hout);
-
-    if (ml_read_file(outpath, &buf, &len) && buf) {
-        brace = strchr(buf, '{');
-        root = brace ? json_parse(brace) : NULL;
-        if (root) {
-            double d = json_num(root, "download_mbps", -1);
-            double u = json_num(root, "upload_mbps",   -1);
-            double p = json_num(root, "ping_ms",       -1);
-            if (d >= 0 || u >= 0) {
-                if (down) *down = d < 0 ? 0 : d;
-                if (up)   *up   = u < 0 ? 0 : u;
-                if (ping) *ping = p < 0 ? 0 : p;
-                ok = TRUE;
-            }
-            json_free(root);
-        }
-        free(buf);
-    }
-    DeleteFileA(outpath);
-
-    if (!ok && err && !err[0])
-        ml_strlcpy(err, wr != WAIT_OBJECT_0 ? "yaspeed завис (таймаут)" : "нет результата от yaspeed", errcap);
-    return ok;
-}
-
 /* ------------------------------------------------------------- sweeps */
 static void wan_sweep(const Config *c)
 {
@@ -276,6 +168,7 @@ static void wan_sweep(const Config *c)
 static void speed_sweep(const Config *c)
 {
     int i;
+    const char *proxy = c->lan_ip[0] ? c->lan_ip : "127.0.0.1";
     load_rows();
     for (i = 0; i < c->count; i++) {
         const Modem *m = &c->modems[i];
@@ -283,10 +176,11 @@ static void speed_sweep(const Config *c)
         double d = 0, u = 0, p = 0;
         char err[96] = {0};
         BOOL ok;
-        if (!m->enabled || !m->login[0]) continue;
+        if (!m->enabled || !m->login[0] || !ml_port_valid(m->proxy_port)) continue;
         row = row_for(m->id);
         if (!row) continue;
-        ok = checks_speedtest(m->lan_ip, &d, &u, &p, err, sizeof(err));
+        ok = speedtest_run(proxy, m->proxy_port, m->login, m->pass,
+                           8, 6, &d, &u, &p, NULL, 0, err, sizeof(err));
         ts_now(row->speed_ts, sizeof(row->speed_ts));
         if (ok) {
             row->down = d; row->up = u; row->ping = p;
@@ -295,7 +189,6 @@ static void speed_sweep(const Config *c)
             ml_strlcpy(row->speed_err, err, sizeof(row->speed_err));
         }
         save_rows();   /* persist as we go; a test is slow, don't lose earlier ones */
-        if (!ok && !strncmp(err, "yaspeed.exe", 11)) break;  /* missing tool: stop */
     }
     ml_log("checks: speed sweep done");
 }
