@@ -40,8 +40,8 @@ body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:13px
 .rail .foot .st.up i{background:var(--ok)}
 
 /* ---- main ---- */
-.main{flex:1;min-width:0;display:flex;flex-direction:column;background:var(--content)}
-.topbar{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line)}
+.main{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;background:var(--content)}
+.topbar{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line);flex:0 0 auto}
 .topbar h1{font-size:16px;font-weight:500;letter-spacing:-.01em}
 .topbar .sub{font-family:var(--mono);font-size:11px;color:var(--tx3)}
 .topbar .sp{flex:1}
@@ -152,7 +152,7 @@ input::placeholder{color:var(--tx3)}
 .menu button{display:block;width:100%;text-align:left;background:none;border:none;color:var(--tx);
   font-family:inherit;font-size:12.5px;padding:8px 10px;border-radius:7px;cursor:pointer;transition:background .14s var(--ease)}
 .menu button:hover{background:rgba(255,255,255,.06)}
-.view{display:none} .view.on{display:block}
+.view{display:none} .view.on{display:flex;flex-direction:column;flex:1;min-height:0}
 .spin{animation:sp 1s linear infinite} @keyframes sp{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
@@ -308,7 +308,7 @@ function summary(){
   const host=ST.network.lan_ip||"0.0.0.0";
   $("#topSub").textContent=host+" · базовый :"+(ST.network.base_port||15000);
   $("#emptyModems").style.display=n?"none":"block";
-  $(".tablewrap").style.display=n?"block":"none";
+  $(".tablewrap").style.display=n?"flex":"none";
 }
 function rowHTML(m){
   const dis=m.enabled?"":" dis";
