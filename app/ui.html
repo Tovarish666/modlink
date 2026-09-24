@@ -536,9 +536,9 @@ async function doCopyAll(mode){
   if(mode==="proxy"){ text=prox.join("\n"); cnt=prox.length; }
   else if(mode==="reboot"){ text=reb.join("\n"); cnt=reb.length; }
   else if(mode==="reconn"){ text=rec.join("\n"); cnt=rec.length; }
-  else { // all: за каждым модемом три строки подряд
-    text=ms.map(m=>proxyLine(m)+"\n"+rebootLine(m)+"\n"+reconnLine(m)).join("\n\n");
-    cnt=ms.length*3;
+  else { // all: одна строка на модем, поля через таб -> 3 колонки таблицы
+    text=ms.map(m=>proxyLine(m)+"\t"+rebootLine(m)+"\t"+reconnLine(m)).join("\n");
+    cnt=ms.length;
   }
   const ok=await copyText(text);
   toast(ok?("Скопировано строк: "+cnt):"Не удалось скопировать",ok?"ok":"err");
