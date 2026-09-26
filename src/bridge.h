@@ -23,6 +23,8 @@ void  pv_shutdown(void);
 char *pv_get_state(const char *req);   /* {network:{...}, modems:[...], running} */
 char *pv_status(const char *req);      /* {running:bool} — cheap poll            */
 char *pv_checks(const char *req);      /* checks.json (periodic WAN + speed)      */
+char *pv_log_modlink(const char *req); /* {lines:[...]} tail of modlink.log       */
+char *pv_log_3proxy(const char *req);  /* {lines:[...]} tail of 3proxy.log        */
 char *pv_clip(const char *req);        /* req[0] = text -> Windows clipboard      */
 
 /* --- mutate (fast, run on the UI thread) ------------------------------ */

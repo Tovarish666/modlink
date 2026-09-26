@@ -284,9 +284,10 @@ char *pv_save_network(const char *req)
 
 char *pv_add_modem(const char *req)
 {
-    char *s; (void)req;
+    char *s; int idx; (void)req;
     lock();
-    cfg_add_modem(&g_cfg);
+    idx = cfg_add_modem(&g_cfg);
+    if (idx >= 0) ml_log("модем №%d добавлен (%s)", g_cfg.modems[idx].n, g_cfg.modems[idx].login);
     cfg_save(&g_cfg);
     s = emit_state_locked();
     unlock();
@@ -531,6 +532,38 @@ char *pv_checks(const char *req)
     if (ml_read_file(path, &buf, &len) && buf && len) return buf;
     free(buf);
     { char *s = (char *)malloc(16); if (s) memcpy(s, "{\"modems\":[]}", 14); return s; }
+}
+
+/* Tail a log file into {"lines":[...]} (oldest first). */
+static char *log_tail_json(const char *path, int maxlines)
+{
+    char **lines = NULL;
+    int n = ml_tail_file(path, maxlines, &lines), i;
+    JBuf b;
+    jb_init(&b);
+    jb_raw(&b, "{\"lines\":[");
+    for (i = 0; i < n; i++) {
+        if (i) jb_raw(&b, ",");
+        jb_str(&b, lines[i] ? lines[i] : "");
+        free(lines[i]);
+    }
+    free(lines);
+    jb_raw(&b, "]}");
+    return jret(&b);
+}
+
+char *pv_log_modlink(const char *req)
+{
+    char path[ML_PATH_LEN];
+    (void)req;
+    snprintf(path, sizeof(path), "%s\\modlink.log", ml_dir_logs());
+    return log_tail_json(path, 500);
+}
+
+char *pv_log_3proxy(const char *req)
+{
+    (void)req;
+    return log_tail_json(ml_path_3plog(), 500);
 }
 
 /* Manual speed test for one modem — the native yaspeed port, run through the
